@@ -48,7 +48,7 @@ jobs:
         run: |
           # Detect SDK version and pass it to make
           SDK_VERSION=$(xcrun --sdk iphoneos --show-sdk-version)
-          make package THEOS_PACKAGE_SCHEME=rootless TARGET="iphone:clang:${SDK_VERSION}:14.0"
+          make package
 
       - name: Upload .deb
         uses: actions/upload-artifact@v4
