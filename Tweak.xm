@@ -114,7 +114,14 @@ static AVAssetReader *g_frameReader = nil;
 static AVAssetReaderTrackOutput *g_frameOutput = nil;
 static OSType g_frameSubType = 0;            // format the live reader produces
 static NSTimeInterval g_frameInterval = 1.0 / 30.0;
-static NSTimeInterval g_nextFrameDue = 0;    // wall clock for the next preview frame
+static NSTimeInterval g_nextFrameDue = 0;    // media clock time the next preview frame is due
+
+// Slack allowed when asking whether the next frame is due, in seconds — half a
+// tick of a 60Hz display link. Display-link callbacks do not land on the exact
+// millisecond, and without this the fraction of a millisecond a callback arrives
+// early costs a whole extra tick: measured over 15 seconds, the preview ran at
+// 23fps with gaps clustered at 33ms and 50ms rather than a steady 33ms.
+#define VCAM_PACE_SLACK 0.008
 static CMSampleBufferRef g_cachedFrame = NULL;
 static NSTimeInterval g_lastPreviewFrame = 0;
 
@@ -273,7 +280,10 @@ static NSTimeInterval g_lastPreviewFrame = 0;
 
     if (!vcam_active()) return NULL;
 
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    // Monotonic: this clock is what the display link is on, and it cannot be
+    // walked backwards underneath a half-finished frame the way the wall clock
+    // can.
+    NSTimeInterval now = CACurrentMediaTime();
 
     if (g_bufferReload) {
         // A failed load leaves the flag set so a later frame retries. Throttle
@@ -302,7 +312,7 @@ static NSTimeInterval g_lastPreviewFrame = 0;
     // that passes a source buffer is already paced by the camera, and forceRenew
     // (the still path) wants a frame now regardless.
     if (originSampleBuffer == NULL && !forceRenew) {
-        if (now < g_nextFrameDue) return NULL;
+        if (now + VCAM_PACE_SLACK < g_nextFrameDue) return NULL;
         g_nextFrameDue = (g_nextFrameDue < now ? now : g_nextFrameDue) + g_frameInterval;
     }
 
@@ -489,8 +499,9 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
 
     // An app with a VideoDataOutput already feeds the layer; don't fight it.
     // That path only stamps the time when it actually enqueued, so this also
-    // means the layer is being drawn to right now.
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970] * 1000.0;
+    // means the layer is being drawn to right now. Milliseconds on the media
+    // clock, matching what the delegate above stamps.
+    NSTimeInterval now = CACurrentMediaTime() * 1000.0;
     if (now - g_lastVideoDataOutputTime < 1000) {
         g_maskLayer.opacity = 1;
         g_previewLayer.opacity = 1;
@@ -569,7 +580,9 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
                     vcam_enqueue_frame(g_previewLayer, replacement);
                     // Stamped only once a frame is really on its way to the layer:
                     // the display link reads this to know the layer is covered.
-                    g_lastVideoDataOutputTime = [[NSDate date] timeIntervalSince1970] * 1000.0;
+                    // Same clock the display link reads, or the comparison in
+                    // vcam_step: silently stops meaning anything.
+                    g_lastVideoDataOutputTime = CACurrentMediaTime() * 1000.0;
                 }
                 if (original) {
                     original(dself, @selector(captureOutput:didOutputSampleBuffer:fromConnection:),
