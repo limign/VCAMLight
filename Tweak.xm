@@ -40,6 +40,7 @@ static NSData *vcam_jpeg_from_current_frame(void);
 
 static NSFileManager *g_fm = nil;
 static BOOL g_bufferReload = YES;       // restart the reader on the next frame
+static NSTimeInterval g_reloadNotBefore = 0;  // backoff for failed load attempts
 static AVSampleBufferDisplayLayer *g_previewLayer = nil;
 static CALayer *g_maskLayer = nil;
 static NSTimeInterval g_lastVideoDataOutputTime = 0;
@@ -51,6 +52,13 @@ static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationP
 static BOOL g_replOn = NO;
 static BOOL g_loopOn = YES;
 static NSTimeInterval g_lastPrefsCheck = 0;
+
+// Ask for a reload, holding off the next attempt briefly: a broken or
+// unreadable video would otherwise rebuild an AVAsset on every single frame.
+static void vcam_reload_later(NSTimeInterval now) {
+    g_bufferReload = YES;
+    g_reloadNotBefore = now + 0.5;
+}
 
 static void vcam_reload_prefs(void) {
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
@@ -118,16 +126,32 @@ static BOOL vcam_active(void) {
     if (!vcam_active()) return NULL;
 
     if (g_bufferReload) {
+        // A failed load leaves the flag set so a later frame retries. Throttle
+        // only those retries — a reload after the video loops has to happen
+        // immediately or every repeat of a short clip would stall.
+        NSTimeInterval attemptNow = [[NSDate date] timeIntervalSince1970];
+        if (attemptNow < g_reloadNotBefore) return NULL;
+
         g_bufferReload = NO;
         @try {
             reader = nil; out32BGRA = nil; out420v = nil; out420f = nil;
 
             AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:VCAM_VIDEO_PATH]];
             AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-            if (track == nil) return NULL;
+            if (track == nil) {
+                // AVFoundation loads an asset's tracks asynchronously and this
+                // reads them synchronously, so inside a sandboxed app the first
+                // calls routinely come back empty for a perfectly good file
+                // (measured: the same path yields 1 track and then 0 on
+                // consecutive calls). Ask for a retry rather than returning with
+                // g_bufferReload already cleared, which would leave the overlay
+                // black forever.
+                vcam_reload_later(attemptNow);
+                return NULL;
+            }
 
             reader = [AVAssetReader assetReaderWithAsset:asset error:nil];
-            if (reader == nil) return NULL;
+            if (reader == nil) { vcam_reload_later(attemptNow); return NULL; }
 
             out32BGRA = [[AVAssetReaderTrackOutput alloc] initWithTrack:track
                 outputSettings:@{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA) }];
@@ -139,8 +163,14 @@ static BOOL vcam_active(void) {
             [reader addOutput:out32BGRA];
             [reader addOutput:out420v];
             [reader addOutput:out420f];
-            [reader startReading];
+            if (![reader startReading] && reader.status != AVAssetReaderStatusReading) {
+                vcam_reload_later(attemptNow);
+                return NULL;
+            }
+
+            g_reloadNotBefore = 0;   // loaded cleanly
         } @catch (NSException *e) {
+            vcam_reload_later(attemptNow);
             return NULL;
         }
     }
