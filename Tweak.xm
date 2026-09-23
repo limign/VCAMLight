@@ -95,10 +95,27 @@ static BOOL vcam_active(void) {
 // caller has no source buffer (preview tick, photo conversion).
 + (CMSampleBufferRef)nextFrameForBuffer:(CMSampleBufferRef)originSampleBuffer
                              forceRenew:(BOOL)forceRenew;
+// The work nextFrameForBuffer: serialises. Declared here only so it can be
+// called before it is defined; callers outside this class want the wrapper.
++ (CMSampleBufferRef)vcam_frame:(CMSampleBufferRef)originSampleBuffer
+                     forceRenew:(BOOL)forceRenew;
 + (UIWindow *)keyWindow;
 // Path AVAssetReader is allowed to open, or nil when the master is unreadable.
 + (NSString *)playbackPath;
 @end
+
+// Reader state, kept between frames. One reader at a time: a reader is single
+// use, so looping builds a new one over the asset already parsed rather than
+// re-reading the file.
+static AVAsset *g_frameAsset = nil;
+static AVAssetTrack *g_frameTrack = nil;
+static AVAssetReader *g_frameReader = nil;
+static AVAssetReaderTrackOutput *g_frameOutput = nil;
+static OSType g_frameSubType = 0;            // format the live reader produces
+static NSTimeInterval g_frameInterval = 1.0 / 30.0;
+static NSTimeInterval g_nextFrameDue = 0;    // wall clock for the next preview frame
+static CMSampleBufferRef g_cachedFrame = NULL;
+static NSTimeInterval g_lastPreviewFrame = 0;
 
 @implementation VCAMFrameSource
 
@@ -136,16 +153,111 @@ static BOOL vcam_active(void) {
     return VCAM_PLAYBACK_PATH;
 }
 
+// Opens a reader over the already-parsed asset, in the format the caller needs.
+// A reader cannot be restarted, and the wanted format can change under us (the
+// preview takes BGRA, a capture pipeline may hand us 420f), so this is both the
+// open and the reopen.
++ (BOOL)openReaderForSubType:(OSType)subType {
+    g_frameReader = nil;
+    g_frameOutput = nil;
+    if (g_frameAsset == nil || g_frameTrack == nil) return NO;
+
+    AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:g_frameAsset error:nil];
+    if (reader == nil) return NO;
+
+    AVAssetReaderTrackOutput *output =
+        [[AVAssetReaderTrackOutput alloc] initWithTrack:g_frameTrack
+                                         outputSettings:@{ (id)kCVPixelBufferPixelFormatTypeKey: @(subType) }];
+    [reader addOutput:output];
+    if (![reader startReading] && reader.status != AVAssetReaderStatusReading) return NO;
+
+    g_frameReader = reader;
+    g_frameOutput = output;
+    g_frameSubType = subType;
+    return YES;
+}
+
+// Parses the staged file. Returns NO when the asset or its track list is not
+// readable yet, which the caller retries rather than treating as empty.
++ (BOOL)loadAsset {
+    g_frameAsset = nil;
+    g_frameTrack = nil;
+
+    // Decode from the staged copy, never from the master: see +playbackPath for
+    // why AVAssetReader cannot open the master from inside an app.
+    NSString *playback = [self playbackPath];
+    if (playback == nil) return NO;
+
+    AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:playback]];
+    // AVFoundation loads an asset's tracks asynchronously and this reads them
+    // synchronously, so inside a sandboxed app the first calls routinely come
+    // back empty for a perfectly good file (measured: the same path yields 1
+    // track and then 0 on consecutive calls).
+    AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+    if (track == nil) return NO;
+
+    g_frameAsset = asset;
+    g_frameTrack = track;
+    float rate = track.nominalFrameRate;
+    g_frameInterval = (rate > 1.0f) ? (1.0 / rate) : (1.0 / 30.0);
+    return YES;
+}
+
+// Re-times a decoded frame. With a source buffer we keep the client's own
+// timestamps so its bookkeeping still lines up; without one we stamp "now", so
+// the display layer shows the frame immediately instead of judging a clip that
+// starts at zero to be hopelessly late.
++ (CMSampleBufferRef)retime:(CMSampleBufferRef)decoded
+                     origin:(CMSampleBufferRef)originSampleBuffer
+                  wallClock:(NSTimeInterval)now {
+    CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(decoded);
+    if (pixels == NULL) return NULL;
+
+    CMSampleTimingInfo timing = {
+        .duration = originSampleBuffer ? CMSampleBufferGetDuration(originSampleBuffer)
+                                       : CMTimeMakeWithSeconds(g_frameInterval, 1000000),
+        .presentationTimeStamp = originSampleBuffer ? CMSampleBufferGetPresentationTimeStamp(originSampleBuffer)
+                                                    : CMTimeMakeWithSeconds(now, 1000000),
+        .decodeTimeStamp = originSampleBuffer ? CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
+                                              : kCMTimeInvalid,
+    };
+    CMVideoFormatDescriptionRef vfmt = NULL;
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixels, &vfmt);
+    if (vfmt == NULL) return NULL;
+
+    CMSampleBufferRef wrapped = NULL;
+    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixels, true, NULL, NULL,
+                                       vfmt, &timing, &wrapped);
+    CFRelease(vfmt);
+    if (wrapped == NULL) return NULL;
+
+    if (originSampleBuffer != NULL) {
+        // Carry the EXIF/TIFF attachments across; some clients read them.
+        // CMGetAttachment hands back a CFTypeRef; the attachment keys above are
+        // always dictionaries in practice.
+        CFDictionaryRef exif = (CFDictionaryRef)CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
+        CFDictionaryRef tiff = (CFDictionaryRef)CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
+        if (exif) CMSetAttachment(wrapped, (CFStringRef)@"{Exif}", exif, kCMAttachmentMode_ShouldPropagate);
+        if (tiff) CMSetAttachment(wrapped, (CFStringRef)@"{TIFF}", tiff, kCMAttachmentMode_ShouldPropagate);
+    }
+    return wrapped;
+}
+
 + (CMSampleBufferRef)nextFrameForBuffer:(CMSampleBufferRef)originSampleBuffer
                              forceRenew:(BOOL)forceRenew {
-    static AVAssetReader *reader = nil;
-    static AVAssetReaderTrackOutput *out32BGRA = nil;
-    static AVAssetReaderTrackOutput *out420v = nil;
-    static AVAssetReaderTrackOutput *out420f = nil;
-    // Holds the frame we last handed out so it stays alive while the caller uses
-    // it; replaced (and the old one released) on the following call.
-    static CMSampleBufferRef cached = NULL;
+    // Three threads reach this engine on their own schedules: the preview's
+    // display link on the main thread, the video-data-output delegate on the
+    // queue the app gave it, and the still paths on whatever queue the capture
+    // session used. There is one reader and one cached buffer between them, and
+    // the cached buffer is released by the next call — so without this they
+    // would hand each other freed memory. Take turns.
+    @synchronized (self) {
+        return [self vcam_frame:originSampleBuffer forceRenew:forceRenew];
+    }
+}
 
++ (CMSampleBufferRef)vcam_frame:(CMSampleBufferRef)originSampleBuffer
+                     forceRenew:(BOOL)forceRenew {
     // What format is the real camera handing us? We must decode the video in
     // that same format, otherwise the client sees a mismatched image buffer and
     // will stretch, mis-colour or crash.
@@ -161,125 +273,63 @@ static BOOL vcam_active(void) {
 
     if (!vcam_active()) return NULL;
 
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+
     if (g_bufferReload) {
         // A failed load leaves the flag set so a later frame retries. Throttle
         // only those retries — a reload after the video loops has to happen
         // immediately or every repeat of a short clip would stall.
-        NSTimeInterval attemptNow = [[NSDate date] timeIntervalSince1970];
-        if (attemptNow < g_reloadNotBefore) return NULL;
+        if (now < g_reloadNotBefore) return NULL;
 
         g_bufferReload = NO;
         @try {
-            reader = nil; out32BGRA = nil; out420v = nil; out420f = nil;
-
-            // Decode from the staged copy, never from the master: see
-            // +playbackPath for why AVAssetReader cannot open the master here.
-            NSString *playback = [VCAMFrameSource playbackPath];
-            if (playback == nil) { vcam_reload_later(attemptNow); return NULL; }
-
-            AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:playback]];
-            AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
-            if (track == nil) {
-                // AVFoundation loads an asset's tracks asynchronously and this
-                // reads them synchronously, so inside a sandboxed app the first
-                // calls routinely come back empty for a perfectly good file
-                // (measured: the same path yields 1 track and then 0 on
-                // consecutive calls). Ask for a retry rather than returning with
-                // g_bufferReload already cleared, which would leave the overlay
-                // black forever.
-                vcam_reload_later(attemptNow);
-                return NULL;
-            }
-
-            reader = [AVAssetReader assetReaderWithAsset:asset error:nil];
-            if (reader == nil) { vcam_reload_later(attemptNow); return NULL; }
-
-            out32BGRA = [[AVAssetReaderTrackOutput alloc] initWithTrack:track
-                outputSettings:@{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA) }];
-            out420v = [[AVAssetReaderTrackOutput alloc] initWithTrack:track
-                outputSettings:@{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) }];
-            out420f = [[AVAssetReaderTrackOutput alloc] initWithTrack:track
-                outputSettings:@{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) }];
-
-            [reader addOutput:out32BGRA];
-            [reader addOutput:out420v];
-            [reader addOutput:out420f];
-            if (![reader startReading] && reader.status != AVAssetReaderStatusReading) {
-                vcam_reload_later(attemptNow);
-                return NULL;
-            }
-
+            if (![self loadAsset]) { vcam_reload_later(now); return NULL; }
+            if (![self openReaderForSubType:subType]) { vcam_reload_later(now); return NULL; }
             g_reloadNotBefore = 0;   // loaded cleanly
+            g_nextFrameDue = 0;
         } @catch (NSException *e) {
-            vcam_reload_later(attemptNow);
+            vcam_reload_later(now);
             return NULL;
         }
+    } else if (g_frameReader == nil || g_frameSubType != subType) {
+        if (![self openReaderForSubType:subType]) { vcam_reload_later(now); return NULL; }
+        g_nextFrameDue = 0;
     }
 
-    CMSampleBufferRef b32 = [out32BGRA copyNextSampleBuffer];
-    CMSampleBufferRef b420v = [out420v copyNextSampleBuffer];
-    CMSampleBufferRef b420f = [out420f copyNextSampleBuffer];
-
-    CMSampleBufferRef decoded = NULL;
-    switch (subType) {
-        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
-            if (b420v) CMSampleBufferCreateCopy(kCFAllocatorDefault, b420v, &decoded);
-            break;
-        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
-            if (b420f) CMSampleBufferCreateCopy(kCFAllocatorDefault, b420f, &decoded);
-            break;
-        default:
-            if (b32) CMSampleBufferCreateCopy(kCFAllocatorDefault, b32, &decoded);
-            break;
+    // A display link ticks far faster than the clip's own frame rate. Without
+    // pacing we would hand over a frame per tick, which runs the video at screen
+    // refresh rate and burns through the whole file in half the time. A caller
+    // that passes a source buffer is already paced by the camera, and forceRenew
+    // (the still path) wants a frame now regardless.
+    if (originSampleBuffer == NULL && !forceRenew) {
+        if (now < g_nextFrameDue) return NULL;
+        g_nextFrameDue = (g_nextFrameDue < now ? now : g_nextFrameDue) + g_frameInterval;
     }
-    if (b32) CFRelease(b32);
-    if (b420v) CFRelease(b420v);
-    if (b420f) CFRelease(b420f);
+
+    CMSampleBufferRef decoded = [g_frameOutput copyNextSampleBuffer];
 
     if (decoded == NULL) {
-        // End of video. Loop if asked, otherwise fall back to the real camera.
-        if (g_loopOn) g_bufferReload = YES;
-        else g_replOn = NO;
-        return NULL;
+        // End of the clip. Restart it here rather than waiting for the next tick
+        // to notice, which would drop the overlay for a moment at every loop.
+        if (!g_loopOn) { g_replOn = NO; return NULL; }
+        // A reopen that fails leaves a dead reader behind, and nothing else
+        // would ever rebuild it — ask for a full reload instead of returning
+        // into a state that can only hand back NULL.
+        if (![self openReaderForSubType:subType]) { g_bufferReload = YES; return NULL; }
+        g_nextFrameDue = 0;
+        decoded = [g_frameOutput copyNextSampleBuffer];
+        if (decoded == NULL) return NULL;
     }
 
-    CMSampleBufferRef result = decoded;
+    CMSampleBufferRef result = [self retime:decoded origin:originSampleBuffer wallClock:now];
+    CFRelease(decoded);
+    if (result == NULL) return NULL;
 
-    if (originSampleBuffer != NULL) {
-        // Re-wrap the decoded pixels with the *source* buffer's timing so the
-        // client's own timestamp bookkeeping keeps working.
-        CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(decoded);
-        if (pixels == NULL) { CFRelease(decoded); return NULL; }
-
-        CMSampleTimingInfo timing = {
-            .duration = CMSampleBufferGetDuration(originSampleBuffer),
-            .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
-            .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer),
-        };
-        CMVideoFormatDescriptionRef vfmt = NULL;
-        CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixels, &vfmt);
-        if (vfmt == NULL) { CFRelease(decoded); return NULL; }
-
-        CMSampleBufferRef wrapped = NULL;
-        CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixels, true, NULL, NULL,
-                                           vfmt, &timing, &wrapped);
-        CFRelease(vfmt);
-        CFRelease(decoded);
-        if (wrapped == NULL) return NULL;
-
-        // Carry the EXIF/TIFF attachments across; some clients read them.
-        // CMGetAttachment hands back a CFTypeRef; the attachment keys above are
-        // always dictionaries in practice.
-        CFDictionaryRef exif = (CFDictionaryRef)CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
-        CFDictionaryRef tiff = (CFDictionaryRef)CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
-        if (exif) CMSetAttachment(wrapped, (CFStringRef)@"{Exif}", exif, kCMAttachmentMode_ShouldPropagate);
-        if (tiff) CMSetAttachment(wrapped, (CFStringRef)@"{TIFF}", tiff, kCMAttachmentMode_ShouldPropagate);
-        result = wrapped;
-    }
-
-    if (cached != NULL) CFRelease(cached);
-    cached = result;
-    return cached;
+    // Holds the frame we last handed out so it stays alive while the caller uses
+    // it; replaced (and the old one released) on the following call.
+    if (g_cachedFrame != NULL) CFRelease(g_cachedFrame);
+    g_cachedFrame = result;
+    return g_cachedFrame;
 }
 
 + (UIWindow *)keyWindow {
@@ -298,7 +348,9 @@ static BOOL vcam_active(void) {
 
 // Renders the current replacement frame to JPEG, honouring orientation.
 static NSData *vcam_jpeg_from_current_frame(void) {
-    CMSampleBufferRef frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:NO];
+    // forceRenew: the still path runs off the capture queue, not the display
+    // link, so it must not be told "not due yet" and hand back nothing.
+    CMSampleBufferRef frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:YES];
     if (frame == NULL) return nil;
     CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(frame);
     if (pixels == NULL) return nil;
@@ -428,10 +480,17 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
 
     CMSampleBufferRef frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:NO];
     if (frame == NULL) {
-        g_maskLayer.opacity = 0;
-        g_previewLayer.opacity = 0;
+        // The engine paces itself, so a NULL here is the normal case on most
+        // ticks rather than a failure — the clip runs at its own frame rate
+        // while this link ticks at screen rate. Only give up on the overlay
+        // when nothing has actually landed for a while.
+        if (now - g_lastPreviewFrame > 1500) {
+            g_maskLayer.opacity = 0;
+            g_previewLayer.opacity = 0;
+        }
         return;
     }
+    g_lastPreviewFrame = now;
     g_maskLayer.opacity = 1;
     g_previewLayer.opacity = 1;
     vcam_enqueue_frame(g_previewLayer, frame);
@@ -496,6 +555,53 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
                 if (original) {
                     original(dself, @selector(captureOutput:didOutputSampleBuffer:fromConnection:),
                              output, replacement ?: sampleBuffer, connection);
+                }
+            }),
+            (IMP *)&original);
+    }
+    %orig;
+}
+
+%end
+
+#pragma mark - Metadata (QR codes, faces)
+
+// Measured on the test device: the Camera app holds one AVCaptureMetadataOutput
+// configured for {org.iso.QRCode, com.apple.AppClipCode, face}, and it is how
+// the app recognises a QR code held up to the lens. The detection itself uses
+// the real frames, so a replacement video on screen changes nothing about it —
+// which is why a QR code still gets recognised over the top of the overlay.
+//
+// The delegate callback is the only place the app is told, so while a
+// replacement is active the callback is swallowed. An empty array rather than
+// no call at all: clients that never hear back keep showing the last result.
+%hook AVCaptureMetadataOutput
+
+- (void)setMetadataObjectsDelegate:(id<AVCaptureMetadataOutputObjectsDelegate>)objectsDelegate
+                             queue:(dispatch_queue_t)objectsCallbackQueue {
+    if (objectsDelegate == nil || objectsCallbackQueue == nil) {
+        %orig;
+        return;
+    }
+
+    // Lazy, once per delegate class, same as the video data output above.
+    static NSMutableArray *hookedClasses = nil;
+    if (hookedClasses == nil) hookedClasses = [NSMutableArray new];
+    NSString *cls = NSStringFromClass([objectsDelegate class]);
+
+    if (![hookedClasses containsObject:cls]) {
+        [hookedClasses addObject:cls];
+        __block void (*original)(id, SEL, AVCaptureOutput *,
+                                 NSArray *, AVCaptureConnection *) = NULL;
+        MSHookMessageEx(
+            [objectsDelegate class],
+            @selector(captureOutput:didOutputMetadataObjects:fromConnection:),
+            imp_implementationWithBlock(^(id dself, AVCaptureOutput *output,
+                                          NSArray *objects,
+                                          AVCaptureConnection *connection) {
+                if (original) {
+                    original(dself, @selector(captureOutput:didOutputMetadataObjects:fromConnection:),
+                             output, vcam_active() ? @[] : objects, connection);
                 }
             }),
             (IMP *)&original);
@@ -601,15 +707,23 @@ static NSTimeInterval g_lastUp = 0;
 static NSTimeInterval g_lastDown = 0;
 static NSTimeInterval g_lastToggle = 0;
 
+// How far apart the two presses may land and still count as one gesture. The
+// first cut used 200ms, which is tight even when you are trying to hit it — a
+// human pressing two buttons in sequence routinely lands nearer 300ms.
+#define VCAM_DP_WINDOW 0.45
+
 static void vcam_volume_pressed(BOOL isUp) {
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (isUp) g_lastUp = now; else g_lastDown = now;
 
-    // Both buttons within 200ms, and not more often than once a second.
     if (g_lastUp == 0 || g_lastDown == 0) return;
-    if (fabs(g_lastUp - g_lastDown) > 0.2) return;
+    if (fabs(g_lastUp - g_lastDown) > VCAM_DP_WINDOW) return;
     if (now - g_lastToggle < 1.0) return;
     g_lastToggle = now;
+    // Retire both stamps. Left standing, a single press a second from now would
+    // pair with the stale one and toggle again on its own.
+    g_lastUp = 0;
+    g_lastDown = 0;
 
     dispatch_async(dispatch_get_main_queue(), ^{
         [VCAMOverlay toggle];
@@ -617,6 +731,72 @@ static void vcam_volume_pressed(BOOL isUp) {
 }
 
 %group SpringBoard
+
+// Volume presses are hooked at every layer that can carry one, because the
+// layer that carries them depends on who is using the buttons. In the Camera
+// app they are a shutter: the app takes the press through
+// SBHardwareButtonService and SpringBoard never acts on it, so SBVolumeControl's
+// increaseVolume/decreaseVolume — the obvious hook, and the only one the first
+// cut had — is simply never called there. Measured on 15.7.1, SpringBoard's
+// volume plumbing is:
+//
+//   SBVolumeHardwareButton         volumeIncreasePress: / volumeDecreasePress:
+//   SBVolumeHardwareButtonActions  volumeIncreasePressDownWithModifiers:
+//   SBHardwareButtonService        consumeVolumeIncreaseButtonSinglePressDown…
+//   SBVolumeControl                increaseVolume / decreaseVolume
+//
+// The first two run for every physical press whatever happens to it later, so
+// they are the ones that work in the Camera. The others are kept because they
+// are right elsewhere (the volume HUD, and any press SpringBoard does act on).
+// Overlap is harmless: a duplicated press sets the same stamp twice, and the
+// stamps are retired once a gesture has fired.
+%hook SBVolumeHardwareButton
+
+- (void)volumeIncreasePress:(id)press {
+    %orig;
+    vcam_volume_pressed(YES);
+}
+
+- (void)volumeDecreasePress:(id)press {
+    %orig;
+    vcam_volume_pressed(NO);
+}
+
+%end
+
+%hook SBVolumeHardwareButtonActions
+
+- (void)volumeIncreasePressDownWithModifiers:(long long)modifiers {
+    %orig;
+    vcam_volume_pressed(YES);
+}
+
+- (void)volumeDecreasePressDownWithModifiers:(long long)modifiers {
+    %orig;
+    vcam_volume_pressed(NO);
+}
+
+%end
+
+// Observing only — these answer "did a client take the press?", so returning
+// %orig's answer untouched keeps the Camera's shutter working.
+%hook SBHardwareButtonService
+
+- (BOOL)consumeVolumeIncreaseButtonSinglePressDownWithPriority:(long long)priority
+                                                  continuation:(id)continuation {
+    BOOL taken = %orig;
+    vcam_volume_pressed(YES);
+    return taken;
+}
+
+- (BOOL)consumeVolumeDecreaseButtonSinglePressDownWithPriority:(long long)priority
+                                                  continuation:(id)continuation {
+    BOOL taken = %orig;
+    vcam_volume_pressed(NO);
+    return taken;
+}
+
+%end
 
 %hook SBVolumeControl
 
