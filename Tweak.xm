@@ -96,9 +96,45 @@ static BOOL vcam_active(void) {
 + (CMSampleBufferRef)nextFrameForBuffer:(CMSampleBufferRef)originSampleBuffer
                              forceRenew:(BOOL)forceRenew;
 + (UIWindow *)keyWindow;
+// Path AVAssetReader is allowed to open, or nil when the master is unreadable.
++ (NSString *)playbackPath;
 @end
 
 @implementation VCAMFrameSource
+
+// The media daemon behind AVAssetReader only opens paths this app's sandbox
+// already covers, so the master under Media/.vcamlight cannot be decoded from in
+// here (OSStatus -17507) even though its bytes read back fine. Stage a copy in
+// /var/tmp, which is covered, and decode that. Cheap to re-run: a sidecar records
+// which master revision the copy came from.
++ (NSString *)playbackPath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSDictionary *master = [fm attributesOfItemAtPath:VCAM_VIDEO_PATH error:nil];
+    if (master == nil) return nil;
+
+    NSString *stamp = [NSString stringWithFormat:@"%@ %@",
+                       master[NSFileSize], master[NSFileModificationDate]];
+    NSString *staged = [NSString stringWithContentsOfFile:VCAM_PLAYBACK_STAMP
+                                                 encoding:NSUTF8StringEncoding error:nil];
+    if ([stamp isEqualToString:staged] && [fm fileExistsAtPath:VCAM_PLAYBACK_PATH]) {
+        return VCAM_PLAYBACK_PATH;
+    }
+
+    [fm createDirectoryAtPath:VCAM_PLAYBACK_DIR
+  withIntermediateDirectories:YES attributes:nil error:nil];
+
+    // Plain file IO, not the media daemon: this is the read that the sandbox does
+    // allow on the master.
+    NSData *bytes = [NSData dataWithContentsOfFile:VCAM_VIDEO_PATH];
+    if (bytes == nil) return nil;
+
+    [fm removeItemAtPath:VCAM_PLAYBACK_PATH error:nil];
+    if (![bytes writeToFile:VCAM_PLAYBACK_PATH atomically:YES]) return nil;
+    [stamp writeToFile:VCAM_PLAYBACK_STAMP
+            atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    return VCAM_PLAYBACK_PATH;
+}
 
 + (CMSampleBufferRef)nextFrameForBuffer:(CMSampleBufferRef)originSampleBuffer
                              forceRenew:(BOOL)forceRenew {
@@ -136,7 +172,12 @@ static BOOL vcam_active(void) {
         @try {
             reader = nil; out32BGRA = nil; out420v = nil; out420f = nil;
 
-            AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:VCAM_VIDEO_PATH]];
+            // Decode from the staged copy, never from the master: see
+            // +playbackPath for why AVAssetReader cannot open the master here.
+            NSString *playback = [VCAMFrameSource playbackPath];
+            if (playback == nil) { vcam_reload_later(attemptNow); return NULL; }
+
+            AVAsset *asset = [AVAsset assetWithURL:[NSURL fileURLWithPath:playback]];
             AVAssetTrack *track = [[asset tracksWithMediaType:AVMediaTypeVideo] firstObject];
             if (track == nil) {
                 // AVFoundation loads an asset's tracks asynchronously and this
@@ -352,10 +393,16 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
     // Another preview layer owns the shared display layer right now.
     if (g_previewLayer.superlayer != self) return;
 
-    BOOL active = vcam_active();
-    g_maskLayer.opacity = active ? 1 : 0;
-    g_previewLayer.opacity = active ? 1 : 0;
-    if (!active || !g_cameraRunning) return;
+    // Cover the camera only while there is a replacement frame to cover it with.
+    // The engine legitimately has nothing to hand over at times — no video chosen,
+    // or a staged copy that has not landed yet — and a black mask over a working
+    // preview is worse than no overlay at all, so an empty tick hides us.
+    BOOL active = vcam_active() && g_cameraRunning;
+    if (!active) {
+        g_maskLayer.opacity = 0;
+        g_previewLayer.opacity = 0;
+        return;
+    }
 
     g_previewLayer.frame = self.bounds;
     switch (g_photoOrientation) {
@@ -370,11 +417,23 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
     }
 
     // An app with a VideoDataOutput already feeds the layer; don't fight it.
+    // That path only stamps the time when it actually enqueued, so this also
+    // means the layer is being drawn to right now.
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970] * 1000.0;
-    if (now - g_lastVideoDataOutputTime < 1000) return;
+    if (now - g_lastVideoDataOutputTime < 1000) {
+        g_maskLayer.opacity = 1;
+        g_previewLayer.opacity = 1;
+        return;
+    }
 
     CMSampleBufferRef frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:NO];
-    if (frame == NULL) return;
+    if (frame == NULL) {
+        g_maskLayer.opacity = 0;
+        g_previewLayer.opacity = 0;
+        return;
+    }
+    g_maskLayer.opacity = 1;
+    g_previewLayer.opacity = 1;
     vcam_enqueue_frame(g_previewLayer, frame);
 }
 
@@ -423,7 +482,6 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
             imp_implementationWithBlock(^(id dself, AVCaptureOutput *output,
                                           CMSampleBufferRef sampleBuffer,
                                           AVCaptureConnection *connection) {
-                g_lastVideoDataOutputTime = [[NSDate date] timeIntervalSince1970] * 1000.0;
                 g_photoOrientation = [connection videoOrientation];
 
                 CMSampleBufferRef replacement =
@@ -431,6 +489,9 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
 
                 if (replacement != NULL && g_previewLayer != nil) {
                     vcam_enqueue_frame(g_previewLayer, replacement);
+                    // Stamped only once a frame is really on its way to the layer:
+                    // the display link reads this to know the layer is covered.
+                    g_lastVideoDataOutputTime = [[NSDate date] timeIntervalSince1970] * 1000.0;
                 }
                 if (original) {
                     original(dself, @selector(captureOutput:didOutputSampleBuffer:fromConnection:),
