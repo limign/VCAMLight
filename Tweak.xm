@@ -26,6 +26,11 @@
 #import <objc/runtime.h>
 #import <substrate.h>
 
+// Theos compiles with -Werror, and hooking the legacy still-capture path means
+// naming AVCaptureStillImageOutput, which Apple deprecated in iOS 10 but still
+// ships and which apps on iOS 15 still use. That warning is expected here.
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 #pragma mark - Forward declarations
 
 static BOOL vcam_active(void);
@@ -192,8 +197,10 @@ static BOOL vcam_active(void) {
         if (wrapped == NULL) return NULL;
 
         // Carry the EXIF/TIFF attachments across; some clients read them.
-        CFDictionaryRef exif = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
-        CFDictionaryRef tiff = CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
+        // CMGetAttachment hands back a CFTypeRef; the attachment keys above are
+        // always dictionaries in practice.
+        CFDictionaryRef exif = (CFDictionaryRef)CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
+        CFDictionaryRef tiff = (CFDictionaryRef)CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
         if (exif) CMSetAttachment(wrapped, (CFStringRef)@"{Exif}", exif, kCMAttachmentMode_ShouldPropagate);
         if (tiff) CMSetAttachment(wrapped, (CFStringRef)@"{TIFF}", tiff, kCMAttachmentMode_ShouldPropagate);
         result = wrapped;
@@ -205,8 +212,13 @@ static BOOL vcam_active(void) {
 }
 
 + (UIWindow *)keyWindow {
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (w.isKeyWindow) return w;
+    // Not -[UIApplication windows]: deprecated since iOS 15, and theos builds
+    // with -Werror.
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+            if (w.isKeyWindow) return w;
+        }
     }
     return nil;
 }
@@ -262,7 +274,7 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
     // insertSublayer:above: calls back into addSublayer:, so without this guard
     // our own insertions below would re-enter here and recurse forever.
     static BOOL installing = NO;
-    if (installing) return;
+    if (installing || layer == nil) return;
 
     // A CADisplayLink retains its target, so a single shared link would pin the
     // first preview layer it ever saw. One link per layer, held by association.
@@ -273,7 +285,8 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
         objc_setAssociatedObject(self, &kVCAMLinkKey, link, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
-    if (g_previewLayer == nil) {
+    BOOL created = (g_previewLayer == nil);
+    if (created) {
         g_previewLayer = [[AVSampleBufferDisplayLayer alloc] init];
         g_maskLayer = [CALayer layer];
         g_maskLayer.backgroundColor = [UIColor blackColor].CGColor;
@@ -282,18 +295,15 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
         g_maskLayer.opacity = 0;
     }
 
-    if ([[self sublayers] containsObject:g_previewLayer]) {
-        // Re-created layer (camera switch, re-layout): reuse what we have.
-        [self bringSublayerToFront:g_previewLayer];
-        return;
-    }
-
-    // insertSublayer: moves the layer across from any previous superlayer, so
-    // there is never more than one preview showing replacements.
+    // insertSublayer: re-parents a layer that already has a superlayer, so this
+    // both brings ours back to the front and keeps them off any preview layer
+    // that came before — there is only ever one showing replacements.
     installing = YES;
     [self insertSublayer:g_maskLayer above:layer];
     [self insertSublayer:g_previewLayer above:g_maskLayer];
     installing = NO;
+
+    if (!created) return;
 
     // Geometry is only final once the layer is in a window, so size on the next
     // main-queue turn rather than here.
