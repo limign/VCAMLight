@@ -29,11 +29,6 @@
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results;
 @end
 
-// ── Shared prefs path ─────────────────────────────────────────────────────────
-static NSString *const kPrefsPath  = @"/var/tmp/com.vcamlight.cache/prefs.plist";
-static NSString *const kVideoPath  = @"/var/tmp/com.vcamlight.cache/selected.mov";
-static NSString *const kDarwinNote = @"com.vcamlight.videochanged";
-
 // ── Colors from Screenshot ────────────────────────────────────────────────────
 #define CLR_OVERLAY_BG   [UIColor colorWithWhite:0 alpha:0.4]
 #define CLR_CARD         [UIColor colorWithRed:0.22 green:0.22 blue:0.24 alpha:0.95]
@@ -315,11 +310,20 @@ static NSString *const kDarwinNote = @"com.vcamlight.videochanged";
     [result.itemProvider loadFileRepresentationForTypeIdentifier:typeId completionHandler:^(NSURL *url, NSError *err) {
         if (!url) return;
 
-        [[NSFileManager defaultManager] createDirectoryAtPath:@"/var/tmp/com.vcamlight.cache" withIntermediateDirectories:YES attributes:nil error:nil];
-        
-        NSError *copyErr;
-        [[NSFileManager defaultManager] removeItemAtPath:kVideoPath error:nil];
-        [[NSFileManager defaultManager] copyItemAtPath:url.path toPath:kVideoPath error:&copyErr];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm createDirectoryAtPath:VCAM_DIR withIntermediateDirectories:YES attributes:nil error:nil];
+
+        // The picker hands back a URL in a temp directory that is torn down as
+        // soon as this handler returns, so the copy has to happen here and now.
+        NSError *copyErr = nil;
+        [fm removeItemAtPath:VCAM_VIDEO_PATH error:nil];
+        if (![fm copyItemAtPath:url.path toPath:VCAM_VIDEO_PATH error:&copyErr]) {
+            NSLog(@"[VCAMLight] copy failed: %@", copyErr);
+            return;
+        }
+        // Marker so readers that are already running notice the swap.
+        [fm removeItemAtPath:VCAM_CHANGED_MARK error:nil];
+        [fm createFileAtPath:VCAM_CHANGED_MARK contents:nil attributes:nil];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             [self enableCamera];
@@ -328,12 +332,12 @@ static NSString *const kDarwinNote = @"com.vcamlight.videochanged";
 }
 
 - (void)enableCamera {
-    NSMutableDictionary *prefs = [NSMutableDictionary dictionaryWithContentsOfFile:kPrefsPath] ?: [NSMutableDictionary new];
+    NSMutableDictionary *prefs = [NSMutableDictionary dictionaryWithContentsOfFile:VCAM_PREFS_PATH] ?: [NSMutableDictionary new];
     prefs[@"replOn"]  = @YES;
     prefs[@"loopOn"]  = @YES;
-    prefs[@"galName"] = kVideoPath;
-    [prefs writeToFile:kPrefsPath atomically:YES];
-    notify_post([kDarwinNote UTF8String]);
+    prefs[@"galName"] = VCAM_VIDEO_PATH;
+    [prefs writeToFile:VCAM_PREFS_PATH atomically:YES];
+    notify_post(VCAM_DARWIN_NOTE);
 
     // UI feedback
     self.galleryBtn.backgroundColor = [CLR_PURPLE colorWithAlphaComponent:0.7];
@@ -345,10 +349,10 @@ static NSString *const kDarwinNote = @"com.vcamlight.videochanged";
 }
 
 - (void)disableCamera {
-    NSMutableDictionary *prefs = [NSMutableDictionary dictionaryWithContentsOfFile:kPrefsPath] ?: [NSMutableDictionary new];
+    NSMutableDictionary *prefs = [NSMutableDictionary dictionaryWithContentsOfFile:VCAM_PREFS_PATH] ?: [NSMutableDictionary new];
     prefs[@"replOn"] = @NO;
-    [prefs writeToFile:kPrefsPath atomically:YES];
-    notify_post([kDarwinNote UTF8String]);
+    [prefs writeToFile:VCAM_PREFS_PATH atomically:YES];
+    notify_post(VCAM_DARWIN_NOTE);
 
     // UI feedback
     self.disableBtn.backgroundColor = [CLR_BTN_DARK colorWithAlphaComponent:0.5];

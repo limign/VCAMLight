@@ -4,13 +4,16 @@
 <dict>
     <key>Filter</key>
     <dict>
+        <!-- The camera has to be replaced inside each app that opens it, so the
+             tweak is injected process-wide rather than into mediaserverd.
+
+             "com.apple.UIKit" matches any process with UIKit loaded, which is
+             every app; springboard is listed explicitly for the overlay and the
+             volume-button hook. -->
         <key>Bundles</key>
         <array>
+            <string>com.apple.UIKit</string>
             <string>com.apple.springboard</string>
-        </array>
-        <key>Executables</key>
-        <array>
-            <string>mediaserverd</string>
         </array>
     </dict>
 </dict>

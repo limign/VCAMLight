@@ -26,7 +26,7 @@ TWEAK_NAME = VCAMLight
 
 VCAMLight_FILES = Tweak.xm VCAMOverlay.mm
 VCAMLight_CFLAGS = -fobjc-arc -fno-modules
-VCAMLight_FRAMEWORKS = UIKit AVFoundation CoreMedia CoreVideo PhotosUI Foundation
+VCAMLight_FRAMEWORKS = UIKit AVFoundation CoreMedia CoreVideo CoreImage PhotosUI Foundation
 VCAMLight_LIBRARIES = substrate
 
 # -fno-modules keeps us off clang modules, so <roothide.h> is not pulled in
