@@ -44,6 +44,7 @@ static NSTimeInterval g_reloadNotBefore = 0;  // backoff for failed load attempt
 static AVSampleBufferDisplayLayer *g_previewLayer = nil;
 static CALayer *g_maskLayer = nil;
 static NSTimeInterval g_lastVideoDataOutputTime = 0;
+static NSTimeInterval g_lastEnqueueOk = 0;   // last time the display layer took a frame
 static BOOL g_cameraRunning = NO;
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
 
@@ -203,23 +204,25 @@ static NSTimeInterval g_lastPreviewFrame = 0;
     return YES;
 }
 
-// Re-times a decoded frame. With a source buffer we keep the client's own
-// timestamps so its bookkeeping still lines up; without one we stamp "now", so
-// the display layer shows the frame immediately instead of judging a clip that
-// starts at zero to be hopelessly late.
-+ (CMSampleBufferRef)retime:(CMSampleBufferRef)decoded
-                     origin:(CMSampleBufferRef)originSampleBuffer
-                  wallClock:(NSTimeInterval)now {
+// Re-wraps a decoded frame on the source buffer's timeline so a client doing its
+// own timestamp bookkeeping keeps working, and carries the EXIF/TIFF
+// attachments across.
+//
+// Only ever called with a source buffer. A frame handed to the display layer
+// with no source keeps the clip's own presentation time — measured the hard way:
+// stamping it with the wall clock instead puts a PTS of ~1.79e9 seconds on a
+// layer whose clock is the host clock, the layer queues the frame for the year
+// 2026, its queue fills, it stops accepting more, and the preview freezes on the
+// first frame while every tick still reports itself as showing one.
++ (CMSampleBufferRef)rewrap:(CMSampleBufferRef)decoded
+                     origin:(CMSampleBufferRef)originSampleBuffer {
     CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(decoded);
     if (pixels == NULL) return NULL;
 
     CMSampleTimingInfo timing = {
-        .duration = originSampleBuffer ? CMSampleBufferGetDuration(originSampleBuffer)
-                                       : CMTimeMakeWithSeconds(g_frameInterval, 1000000),
-        .presentationTimeStamp = originSampleBuffer ? CMSampleBufferGetPresentationTimeStamp(originSampleBuffer)
-                                                    : CMTimeMakeWithSeconds(now, 1000000),
-        .decodeTimeStamp = originSampleBuffer ? CMSampleBufferGetDecodeTimeStamp(originSampleBuffer)
-                                              : kCMTimeInvalid,
+        .duration = CMSampleBufferGetDuration(originSampleBuffer),
+        .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(originSampleBuffer),
+        .decodeTimeStamp = CMSampleBufferGetDecodeTimeStamp(originSampleBuffer),
     };
     CMVideoFormatDescriptionRef vfmt = NULL;
     CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixels, &vfmt);
@@ -231,15 +234,12 @@ static NSTimeInterval g_lastPreviewFrame = 0;
     CFRelease(vfmt);
     if (wrapped == NULL) return NULL;
 
-    if (originSampleBuffer != NULL) {
-        // Carry the EXIF/TIFF attachments across; some clients read them.
-        // CMGetAttachment hands back a CFTypeRef; the attachment keys above are
-        // always dictionaries in practice.
-        CFDictionaryRef exif = (CFDictionaryRef)CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
-        CFDictionaryRef tiff = (CFDictionaryRef)CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
-        if (exif) CMSetAttachment(wrapped, (CFStringRef)@"{Exif}", exif, kCMAttachmentMode_ShouldPropagate);
-        if (tiff) CMSetAttachment(wrapped, (CFStringRef)@"{TIFF}", tiff, kCMAttachmentMode_ShouldPropagate);
-    }
+    // CMGetAttachment hands back a CFTypeRef; the attachment keys above are
+    // always dictionaries in practice.
+    CFDictionaryRef exif = (CFDictionaryRef)CMGetAttachment(originSampleBuffer, (CFStringRef)@"{Exif}", NULL);
+    CFDictionaryRef tiff = (CFDictionaryRef)CMGetAttachment(originSampleBuffer, (CFStringRef)@"{TIFF}", NULL);
+    if (exif) CMSetAttachment(wrapped, (CFStringRef)@"{Exif}", exif, kCMAttachmentMode_ShouldPropagate);
+    if (tiff) CMSetAttachment(wrapped, (CFStringRef)@"{TIFF}", tiff, kCMAttachmentMode_ShouldPropagate);
     return wrapped;
 }
 
@@ -321,9 +321,14 @@ static NSTimeInterval g_lastPreviewFrame = 0;
         if (decoded == NULL) return NULL;
     }
 
-    CMSampleBufferRef result = [self retime:decoded origin:originSampleBuffer wallClock:now];
-    CFRelease(decoded);
-    if (result == NULL) return NULL;
+    CMSampleBufferRef result = decoded;
+    if (originSampleBuffer != NULL) {
+        // Preview frames are left exactly as the reader produced them. See
+        // +rewrap: for why they must not be stamped with the wall clock.
+        result = [self rewrap:decoded origin:originSampleBuffer];
+        CFRelease(decoded);
+        if (result == NULL) return NULL;
+    }
 
     // Holds the frame we last handed out so it stays alive while the caller uses
     // it; replaced (and the old one released) on the following call.
@@ -382,7 +387,21 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
     if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
         [layer flush];
     }
-    if (!layer.readyForMoreMediaData) return;
+    if (!layer.readyForMoreMediaData) {
+        // Backed up. Normally that is just a slow tick and the next frame goes
+        // through, but a layer can wedge — one bad presentation time and it will
+        // sit on a queue it never drains, reporting itself as rendering while it
+        // shows nothing. Left alone that is permanent, so after a second of
+        // refusing everything, flush the backlog away and try again.
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (g_lastEnqueueOk == 0) g_lastEnqueueOk = now;
+        if (now - g_lastEnqueueOk > 1.0) {
+            [layer flush];
+            g_lastEnqueueOk = now;
+        }
+        return;
+    }
+    g_lastEnqueueOk = [[NSDate date] timeIntervalSince1970];
     [layer enqueueSampleBuffer:buf];
 }
 
