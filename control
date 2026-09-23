@@ -1,8 +1,8 @@
 Package: com.vcamlight.tweak
 Name: VCAMLight
-Version: 2.0
-Architecture: iphoneos-arm64
-Description: Virtual camera for iOS — replace camera feed with any video. Login required.
+Version: 2.0.2
+Architecture: iphoneos-arm64e
+Description: Virtual camera for iOS — replace camera feed with any video.
 Author: VCAMLight
 Maintainer: VCAMLight <dev@local>
 Section: Tweaks

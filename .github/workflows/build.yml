@@ -23,36 +23,53 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/theos
-          key: theos-macOS14-v4
+          key: theos-roothide-macOS14-v1
 
-      - name: Install Theos
+      # RootHide packages need the roothide fork of Theos — it is the fork that
+      # implements THEOS_PACKAGE_SCHEME=roothide (vendor/mod/roothide) and ships
+      # libroothide. Cloning upstream theos here produces a package that will
+      # not install on a RootHide jailbreak.
+      - name: Install roothide Theos
         if: steps.theos-cache.outputs.cache-hit != 'true'
-        run: git clone --recursive https://github.com/theos/theos.git $THEOS
+        run: |
+          git clone --recursive https://github.com/roothide/theos.git "$THEOS"
+          git -C "$THEOS" submodule update --init --recursive
 
       - name: Setup Xcode SDK for Theos
         run: |
-          # Find the SDK that ships with the runner's Xcode (always compatible)
+          # Link the SDK that ships with the runner's Xcode (always compatible)
+          # instead of trusting a prebuilt SDK in the theos checkout.
           XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           SDK_VERSION=$(xcrun --sdk iphoneos --show-sdk-version)
           echo "Using Xcode SDK: $XCODE_SDK (version $SDK_VERSION)"
-
-          # Create sdks dir and symlink the Xcode SDK into theos
-          mkdir -p $THEOS/sdks
+          mkdir -p "$THEOS/sdks"
           ln -sfn "$XCODE_SDK" "$THEOS/sdks/iPhoneOS${SDK_VERSION}.sdk"
-          ls -la $THEOS/sdks/
+          ls -la "$THEOS/sdks/"
 
       - name: Install ldid
-        run: brew install ldid
+        run: brew list ldid >/dev/null 2>&1 || brew install ldid
 
-      - name: Build package
+      - name: Build package (roothide)
         run: |
-          # Detect SDK version and pass it to make
+          # The runner's Xcode SDK changes over time; use the SDK linked above.
           SDK_VERSION=$(xcrun --sdk iphoneos --show-sdk-version)
-          make package
+          make clean
+          make package TARGET="iphone:clang:${SDK_VERSION}:15.0" FINALPACKAGE=1
+
+      - name: Verify package
+        run: |
+          ls -la packages/
+          # Architecture must come out as iphoneos-arm64e for a RootHide install.
+          if command -v dpkg-deb >/dev/null 2>&1; then
+            dpkg-deb -I packages/*.deb
+          else
+            echo "dpkg-deb unavailable; inspecting control via ar"
+            ar p packages/*.deb control.tar.* | tar xzO ./control || true
+          fi
 
       - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
-          name: VCAMLight-deb
+          name: VCAMLight-roothide-deb
           path: packages/*.deb
           if-no-files-found: error

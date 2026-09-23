@@ -1,0 +1,7 @@
+# Theos build output
+packages/
+.theos/
+*.deb
+
+# Local Claude Code settings
+.claude/

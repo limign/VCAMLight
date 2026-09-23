@@ -1,0 +1,4 @@
+# This project is authored on Windows and built on macOS/Linux (Theos).
+# Force LF in the repository so a CRLF checkout can never leak into the Debian
+# control file or the Makefile, where it breaks dpkg/make parsing.
+* text=auto eol=lf
