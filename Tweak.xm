@@ -11,8 +11,10 @@
 //   AVCaptureVideoPreviewLayer  the live preview the user sees
 //   AVCaptureSession            start/stop, so we know a camera is live
 //   AVCaptureVideoDataOutput    frames handed to the app (QR scan, analysis…)
+//   AVCaptureMetadataOutput     barcodes and faces the app recognises
 //   AVCaptureStillImageOutput   legacy still capture
 //   AVCapturePhotoOutput        modern photo capture
+//   AVCaptureMovieFileOutput    video, which the daemon writes for us
 //
 // The tweak is injected into every UIKit process; the volume-button hook at the
 // bottom only takes effect in SpringBoard, where SBVolumeControl exists.
@@ -740,6 +742,135 @@ static void vcam_install_photo_overrides(id photo) {
         }
     }
     %orig;
+}
+
+%end
+
+#pragma mark - Recording
+
+// Video has no frame delegate to intercept: AVCaptureMovieFileOutput hands the
+// file to the media daemon, which writes the camera's own buffers into it, so
+// nothing hooked in this process ever sees the frames. The only way in is to
+// redirect the recording to a scratch file and put the chosen clip in place of
+// the result once recording stops.
+
+// Scratch URL we actually recorded to -> the URL the app asked for.
+static NSMutableDictionary *g_recordingURLs = nil;
+static NSUInteger g_recordingSeq = 0;
+
+// Puts the chosen clip at the app's own output URL, trimmed to the length that
+// was actually recorded, then reports on the main queue — where
+// AVCaptureFileOutput delivers its delegate calls and where the app reads the
+// file back.
+static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(BOOL replaced)) {
+    NSString *source = [VCAMFrameSource playbackPath];
+    if (source == nil) { done(NO); return; }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtURL:appURL error:nil];
+
+    AVURLAsset *recordedAsset = [AVURLAsset URLAssetWithURL:recorded options:nil];
+    AVURLAsset *sourceAsset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:source] options:nil];
+    CMTime sourceLength = sourceAsset.duration;
+    CMTime recordedLength = recordedAsset.duration;
+
+    // The clip should not outlast the recording. An unreadable or zero length
+    // falls back to the whole clip rather than to a still.
+    CMTime length = sourceLength;
+    if (CMTIME_IS_NUMERIC(recordedLength) && CMTIME_IS_NUMERIC(sourceLength) &&
+        CMTimeCompare(recordedLength, kCMTimeZero) > 0 &&
+        CMTimeCompare(recordedLength, sourceLength) < 0) {
+        length = recordedLength;
+    }
+
+    AVAssetExportSession *export =
+        [AVAssetExportSession exportSessionWithAsset:sourceAsset
+                                          presetName:AVAssetExportPresetPassthrough];
+    if (export == nil) {
+        BOOL copied = [fm copyItemAtPath:source toPath:appURL.path error:nil];
+        done(copied);
+        return;
+    }
+
+    // Passthrough re-muxes rather than re-encodes, which matters on a phone this
+    // old: a re-encode of a minute of 1080p is not something to sit through at
+    // the end of a recording.
+    export.outputURL = appURL;
+    export.outputFileType = [appURL.pathExtension.lowercaseString isEqualToString:@"mp4"]
+                                ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie;
+    export.timeRange = CMTimeRangeMake(kCMTimeZero, length);
+
+    [export exportAsynchronouslyWithCompletionHandler:^{
+        BOOL ok = (export.status == AVAssetExportSessionStatusCompleted);
+        if (!ok) {
+            // A container the passthrough would not carry still holds a playable
+            // clip, so fall back to the bytes as they are.
+            [fm removeItemAtURL:appURL error:nil];
+            ok = [fm copyItemAtPath:source toPath:appURL.path error:nil];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ done(ok); });
+    }];
+}
+
+%hook AVCaptureMovieFileOutput
+
+- (void)startRecordingToOutputFileURL:(NSURL *)outputFileURL
+                    recordingDelegate:(id<AVCaptureFileOutputRecordingDelegate>)delegate {
+    if (outputFileURL == nil || delegate == nil || !vcam_active()) {
+        %orig;
+        return;
+    }
+
+    // Same directory as the app's own file, so the media daemon can open it —
+    // it is the daemon that writes the recording. Only the name differs.
+    NSString *ext = outputFileURL.pathExtension.length ? outputFileURL.pathExtension : @"mov";
+    NSString *scratch = [NSTemporaryDirectory() stringByAppendingPathComponent:
+                         [NSString stringWithFormat:@"vcam_recording_%lu.%@",
+                          (unsigned long)++g_recordingSeq, ext]];
+
+    if (g_recordingURLs == nil) g_recordingURLs = [NSMutableDictionary new];
+    g_recordingURLs[scratch] = outputFileURL;
+
+    // The app's delegate class is only known at runtime, so the finish callback
+    // is hooked lazily on first sight, once per class.
+    static NSMutableArray *hookedClasses = nil;
+    if (hookedClasses == nil) hookedClasses = [NSMutableArray new];
+    NSString *cls = NSStringFromClass([delegate class]);
+
+    if (![hookedClasses containsObject:cls]) {
+        [hookedClasses addObject:cls];
+        __block void (*original)(id, SEL, AVCaptureFileOutput *,
+                                 NSURL *, NSArray *, NSError *) = NULL;
+        MSHookMessageEx(
+            [delegate class],
+            @selector(captureOutput:didFinishRecordingToOutputFileAtURL:fromConnections:error:),
+            imp_implementationWithBlock(^(id dself, AVCaptureFileOutput *output,
+                                          NSURL *url, NSArray *connections,
+                                          NSError *error) {
+                NSURL *appURL = g_recordingURLs[url.path];
+                if (appURL == nil) {
+                    if (original) {
+                        original(dself, @selector(captureOutput:didFinishRecordingToOutputFileAtURL:fromConnections:error:),
+                                 output, url, connections, error);
+                    }
+                    return;
+                }
+                [g_recordingURLs removeObjectForKey:url.path];
+
+                vcam_replace_recording(appURL, url, ^(BOOL replaced) {
+                    [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+                    // A failed replacement leaves the real recording, which is
+                    // worse to watch but not broken: the app still gets a file.
+                    if (original) {
+                        original(dself, @selector(captureOutput:didFinishRecordingToOutputFileAtURL:fromConnections:error:),
+                                 output, replaced ? appURL : url, connections, error);
+                    }
+                });
+            }),
+            (IMP *)&original);
+    }
+
+    %orig(scratch ? [NSURL fileURLWithPath:scratch] : outputFileURL, delegate);
 }
 
 %end
