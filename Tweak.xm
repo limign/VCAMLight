@@ -546,6 +546,11 @@ static void vcam_volume_pressed(BOOL isUp) {
         writeToFile:[NSString stringWithFormat:@"%@/loaded_%@", VCAM_DIR, proc]
         atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
+    // Declaring a %group puts everything outside one into the implicit
+    // _ungrouped group, which then has to be initialised by hand — without this
+    // Logos refuses to compile the file and nothing hooks at all.
+    %init;
+
     // SBVolumeControl only exists in SpringBoard, so this group stays inert in
     // every other process.
     if (NSClassFromString(@"SBVolumeControl") != nil) {
