@@ -62,7 +62,15 @@
     return inst;
 }
 
+// Every entry point lands on the main thread before touching anything. performShow
+// builds a UIWindow synchronously with the caller's thread, and doing that off the
+// main thread aborts the process inside QuartzCore's implicit-transaction check —
+// measured as a SpringBoard crash with CA::Transaction::push on the stack.
 + (void)toggle {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self toggle]; });
+        return;
+    }
     VCAMOverlay *ov = [self shared];
     if (ov.overlayWindow && !ov.overlayWindow.hidden) {
         [ov performHide];
@@ -71,8 +79,21 @@
     }
 }
 
-+ (void)show { [[self shared] performShow]; }
-+ (void)hide { [[self shared] performHide]; }
++ (void)show {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self show]; });
+        return;
+    }
+    [[self shared] performShow];
+}
+
++ (void)hide {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ [self hide]; });
+        return;
+    }
+    [[self shared] performHide];
+}
 
 - (void)performShow {
     if (!self.overlayWindow) [self buildWindow];
