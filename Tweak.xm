@@ -783,10 +783,12 @@ static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(
         length = recordedLength;
     }
 
-    AVAssetExportSession *export =
+    // Not named `export`: Theos compiles this file as Objective-C++, where that
+    // is a keyword.
+    AVAssetExportSession *writer =
         [AVAssetExportSession exportSessionWithAsset:sourceAsset
                                           presetName:AVAssetExportPresetPassthrough];
-    if (export == nil) {
+    if (writer == nil) {
         BOOL copied = [fm copyItemAtPath:source toPath:appURL.path error:nil];
         done(copied);
         return;
@@ -795,13 +797,13 @@ static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(
     // Passthrough re-muxes rather than re-encodes, which matters on a phone this
     // old: a re-encode of a minute of 1080p is not something to sit through at
     // the end of a recording.
-    export.outputURL = appURL;
-    export.outputFileType = [appURL.pathExtension.lowercaseString isEqualToString:@"mp4"]
+    writer.outputURL = appURL;
+    writer.outputFileType = [appURL.pathExtension.lowercaseString isEqualToString:@"mp4"]
                                 ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie;
-    export.timeRange = CMTimeRangeMake(kCMTimeZero, length);
+    writer.timeRange = CMTimeRangeMake(kCMTimeZero, length);
 
-    [export exportAsynchronouslyWithCompletionHandler:^{
-        BOOL ok = (export.status == AVAssetExportSessionStatusCompleted);
+    [writer exportAsynchronouslyWithCompletionHandler:^{
+        BOOL ok = (writer.status == AVAssetExportSessionStatusCompleted);
         if (!ok) {
             // A container the passthrough would not carry still holds a playable
             // clip, so fall back to the bytes as they are.
