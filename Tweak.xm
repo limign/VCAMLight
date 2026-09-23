@@ -389,6 +389,16 @@ static NSData *vcam_jpeg_from_current_frame(void) {
 
 static char kVCAMLinkKey;   // association key for the per-layer CADisplayLink
 
+// One clock for every elapsed-time comparison in this file. The wall clock and
+// CACurrentMediaTime() sit about 1.79e12 ms apart, so a stamp written on one and
+// read on the other turns any "has it been N ms yet" test into a constant: the
+// difference goes hugely negative and the comparison is stuck on one arm for the
+// life of the process. Which is exactly what a wall-clock stamp in startRunning
+// did to the display link's guard in vcam_step:.
+static NSTimeInterval vcam_now_ms(void) {
+    return CACurrentMediaTime() * 1000.0;
+}
+
 // A display layer that is mid-failure refuses new buffers until it is flushed;
 // flushing unconditionally on every frame would drop the frame being displayed
 // and show a black flash instead.
@@ -403,15 +413,15 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
         // sit on a queue it never drains, reporting itself as rendering while it
         // shows nothing. Left alone that is permanent, so after a second of
         // refusing everything, flush the backlog away and try again.
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        NSTimeInterval now = vcam_now_ms();
         if (g_lastEnqueueOk == 0) g_lastEnqueueOk = now;
-        if (now - g_lastEnqueueOk > 1.0) {
+        if (now - g_lastEnqueueOk > 1000.0) {
             [layer flush];
             g_lastEnqueueOk = now;
         }
         return;
     }
-    g_lastEnqueueOk = [[NSDate date] timeIntervalSince1970];
+    g_lastEnqueueOk = vcam_now_ms();
     [layer enqueueSampleBuffer:buf];
 }
 
@@ -501,7 +511,7 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
     // That path only stamps the time when it actually enqueued, so this also
     // means the layer is being drawn to right now. Milliseconds on the media
     // clock, matching what the delegate above stamps.
-    NSTimeInterval now = CACurrentMediaTime() * 1000.0;
+    NSTimeInterval now = vcam_now_ms();
     if (now - g_lastVideoDataOutputTime < 1000) {
         g_maskLayer.opacity = 1;
         g_previewLayer.opacity = 1;
@@ -535,7 +545,10 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
 - (void)startRunning {
     g_cameraRunning = YES;
     g_bufferReload = YES;
-    g_lastVideoDataOutputTime = [[NSDate date] timeIntervalSince1970] * 1000.0;
+    // Nothing has reached the display layer yet, so nothing should be suppressing
+    // the display link. Zero means "never", on the media clock every other reader
+    // of this stamp uses.
+    g_lastVideoDataOutputTime = 0;
     %orig;
 }
 
@@ -580,9 +593,7 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
                     vcam_enqueue_frame(g_previewLayer, replacement);
                     // Stamped only once a frame is really on its way to the layer:
                     // the display link reads this to know the layer is covered.
-                    // Same clock the display link reads, or the comparison in
-                    // vcam_step: silently stops meaning anything.
-                    g_lastVideoDataOutputTime = CACurrentMediaTime() * 1000.0;
+                    g_lastVideoDataOutputTime = vcam_now_ms();
                 }
                 if (original) {
                     original(dself, @selector(captureOutput:didOutputSampleBuffer:fromConnection:),
