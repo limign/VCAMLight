@@ -85,10 +85,23 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          DEB=$(ls packages/*.deb | head -1)
-          echo "publishing $DEB"
-          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
-          gh release create latest "$DEB" \
+          set -euo pipefail
+          echo "--- packages/ ---"
+          ls -la packages/
+
+          # Exactly one .deb is expected; glob into $1 rather than piping through
+          # head, which would trip pipefail via SIGPIPE.
+          set -- packages/*.deb
+          DEB="$1"
+          echo "DEB=$DEB"
+          test -f "$DEB"
+
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest \
             --title "VCAMLight latest (${GITHUB_SHA:0:7})" \
-            --notes "Automated build of ${GITHUB_SHA:0:7} on ${GITHUB_REF_NAME}. Architecture iphoneos-arm64e — install with Sileo on Dopamine-RootHide." \
+            --notes "Automated build of ${GITHUB_SHA:0:7} on ${GITHUB_REF_NAME}. Architecture iphoneos-arm64e, for Sileo on Dopamine-RootHide." \
             --prerelease
+          gh release upload latest "$DEB" --clobber
+
+          echo "--- assets now attached ---"
+          gh release view latest --json assets --jq '.assets[].name'
