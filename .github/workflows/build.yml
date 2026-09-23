@@ -57,7 +57,27 @@ jobs:
           # The runner's Xcode SDK changes over time; use the SDK linked above.
           SDK_VERSION=$(xcrun --sdk iphoneos --show-sdk-version)
           make clean
-          make package TARGET="iphone:clang:${SDK_VERSION}:15.0" FINALPACKAGE=1
+          # pipefail keeps make's exit code through the tee, and the captured log
+          # is what the failure step below publishes.
+          set -o pipefail
+          make package TARGET="iphone:clang:${SDK_VERSION}:15.0" FINALPACKAGE=1 2>&1 | tee build.log
+
+      # Job logs need auth to download, which makes a failed build here hard to
+      # diagnose from outside. Publishing the log as a release asset gives it a
+      # public URL, and the .deb step below uses the same trick for the package.
+      - name: Publish build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -f build.log ] || echo "(build.log was never created)" > build.log
+          gh release delete ci-log --yes --cleanup-tag || true
+          gh release create ci-log \
+            --title "Build log ${GITHUB_SHA:0:7}" \
+            --notes "Compiler output for the failed build of ${GITHUB_SHA:0:7} on ${GITHUB_REF_NAME}." \
+            --prerelease
+          gh release upload ci-log build.log --clobber
 
       - name: Verify package
         run: |
