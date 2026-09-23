@@ -11,6 +11,9 @@ jobs:
   build:
     runs-on: macos-14
 
+    permissions:
+      contents: write # required to publish the .deb to a GitHub Release
+
     env:
       THEOS: ${{ github.workspace }}/theos
 
@@ -73,3 +76,19 @@ jobs:
           name: VCAMLight-roothide-deb
           path: packages/*.deb
           if-no-files-found: error
+
+      # Rolling prerelease so the .deb gets a stable, publicly fetchable URL:
+      #   https://github.com/limign/VCAMLight/releases/download/latest/<name>.deb
+      # Actions artifacts require auth to download; a release asset does not.
+      # Recreated on every build, with the tag moved to the current commit.
+      - name: Publish .deb to rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DEB=$(ls packages/*.deb | head -1)
+          echo "publishing $DEB"
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest "$DEB" \
+            --title "VCAMLight latest (${GITHUB_SHA:0:7})" \
+            --notes "Automated build of ${GITHUB_SHA:0:7} on ${GITHUB_REF_NAME}. Architecture iphoneos-arm64e — install with Sileo on Dopamine-RootHide." \
+            --prerelease
