@@ -857,7 +857,10 @@ static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(
                     }
                     return;
                 }
-                [g_recordingURLs removeObjectForKey:url.path];
+                // Deliberately kept. `outputFileURL` is asked for again after the
+                // recording ends — that is when the app hands the file to the
+                // library — and the answer has to stay the app's own URL for the
+                // rest of the session, or the scratch path leaks back out.
 
                 vcam_replace_recording(appURL, url, ^(BOOL replaced) {
                     [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
@@ -873,6 +876,23 @@ static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(
     }
 
     %orig(scratch ? [NSURL fileURLWithPath:scratch] : outputFileURL, delegate);
+}
+
+// The app reads this back and hands the answer to Photos. Left alone it reports
+// the scratch path, so the media library copies the real scene into DCIM as an
+// asset of its own — and, because the scratch is deleted as soon as the clip is
+// written, an unfinished one: no `moov`, so it never plays.
+//
+// Reporting the URL the app actually asked for sends that copy to the file the
+// clip is written to instead. The scratch stays ours, and the only thing the
+// library ever sees is the replacement.
+- (NSURL *)outputFileURL {
+    NSURL *url = %orig;
+    if (url != nil && g_recordingURLs != nil) {
+        NSURL *appURL = g_recordingURLs[url.path];
+        if (appURL != nil) return appURL;
+    }
+    return url;
 }
 
 %end
