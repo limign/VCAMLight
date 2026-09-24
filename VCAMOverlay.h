@@ -59,8 +59,9 @@
 // the frames a looping clip can revisit.
 //
 // A line is the size of the still in bytes, which is also the size the library
-// files it under, so the list can be seeded by walking DCIM and no still has to
-// be read back.
+// files it under. What this covers is a repeat of one of our own stills; stills
+// from before the list existed, or from another camera app, are left to the
+// still being a different file every time (see vcam_marked_jpeg).
 #define VCAM_STILL_SEEN_NAME @"Library/Application Support/VCAMLight/stills.seen"
 #define VCAM_STILL_SEEN_PATH @"/var/tmp/vcamlight/last_stills"
 #define VCAM_STILL_SEEN_KEEP 512
