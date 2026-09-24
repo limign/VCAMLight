@@ -363,11 +363,10 @@ static NSTimeInterval g_lastPreviewFrame = 0;
 
 @end
 
-// Renders the current replacement frame to JPEG, honouring orientation.
-static NSData *vcam_jpeg_from_current_frame(void) {
-    // forceRenew: the still path runs off the capture queue, not the display
-    // link, so it must not be told "not due yet" and hand back nothing.
-    CMSampleBufferRef frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:YES];
+// Renders one decoded frame to JPEG at the frame's own size, honouring the
+// orientation the capture connection reported.
+static NSData *vcam_jpeg_from_frame(CMSampleBufferRef frame,
+                                    AVCaptureVideoOrientation videoOrientation) {
     if (frame == NULL) return nil;
     CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(frame);
     if (pixels == NULL) return nil;
@@ -375,16 +374,42 @@ static NSData *vcam_jpeg_from_current_frame(void) {
     // UIImageOrientation rather than CGImagePropertyOrientation so this stays a
     // UIKit-only conversion and needs no ImageIO import.
     UIImageOrientation orient = UIImageOrientationUp;
-    switch (g_photoOrientation) {
+    switch (videoOrientation) {
         case AVCaptureVideoOrientationPortraitUpsideDown: orient = UIImageOrientationDown;  break;
         case AVCaptureVideoOrientationLandscapeRight:     orient = UIImageOrientationRight; break;
         case AVCaptureVideoOrientationLandscapeLeft:      orient = UIImageOrientationLeft;  break;
         default:                                          orient = UIImageOrientationUp;    break;
     }
 
+    static CIContext *ctx = nil;
+    if (ctx == nil) ctx = [CIContext contextWithOptions:nil];
     CIImage *ci = [CIImage imageWithCVImageBuffer:pixels];
-    UIImage *img = [UIImage imageWithCIImage:ci scale:1.0 orientation:orient];
+    CGImageRef cg = [ctx createCGImage:ci fromRect:ci.extent];
+    if (cg == NULL) return nil;
+
+    // Drawn into a 1:1 context rather than handed to UIImageJPEGRepresentation
+    // as a CIImage-backed UIImage: that path renders at the *screen* scale, 3x
+    // on this device, so a 720x1280 frame was saved as a 2160x3840 blow-up —
+    // measured as a 4.5 MB file for every photo the Camera app stored. Drawing
+    // also bakes the rotation into the pixels instead of leaving it to a scale
+    // nobody here controls.
+    UIImage *raw = [UIImage imageWithCGImage:cg scale:1.0 orientation:orient];
+    CGSize size = raw.size;   // already the oriented size: width and height swap
+    UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
+    [raw drawInRect:CGRectMake(0, 0, size.width, size.height)];
+    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    CGImageRelease(cg);
+
     return UIImageJPEGRepresentation(img, 1.0);
+}
+
+// Renders the current replacement frame to JPEG. forceRenew: the still path runs
+// off the capture queue, not the display link, so it must not be told "not due
+// yet" and hand back nothing.
+static NSData *vcam_jpeg_from_current_frame(void) {
+    CMSampleBufferRef frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:YES];
+    return vcam_jpeg_from_frame(frame, g_photoOrientation);
 }
 
 #pragma mark - Preview replacement
@@ -734,15 +759,34 @@ static NSArray *vcam_metadata_objects(NSArray *objects) {
 
 %end
 
-// AVCapturePhoto is opaque, so rather than swapping its buffer we intercept the
-// representations the client pulls off it. The current replacement frame is kept
-// in a static and the swizzles are installed once per class.
+// AVCapturePhoto is opaque, so rather than swapping its buffers we intercept the
+// representations the client pulls off it. The replacement frame is kept in a
+// static and the swizzles are installed once per class.
+//
+// Two of them matter. -fileDataRepresentation is what gets stored, and
+// -previewPixelBuffer is what the corner thumbnail is drawn from — measured on
+// the device at a capture where the Camera app pulled that one accessor and
+// nothing else off the photo. The framework fills the preview buffer from the
+// real sensor, which is why the saved photo was the clip while the thumbnail
+// beside it still showed the room the phone was pointed at.
 static NSData *g_photoJPEG = nil;
+static CMSampleBufferRef g_photoFrame = NULL;   // keeps the pixels below alive
 static NSMutableArray *g_photoHookedClasses = nil;
 
 static void vcam_install_photo_overrides(id photo) {
-    g_photoJPEG = vcam_jpeg_from_current_frame();
-    if (g_photoJPEG == nil || photo == nil) return;
+    if (photo == nil) return;
+
+    // One frame serves both the file and the thumbnail. Held rather than used
+    // and dropped: the engine releases its cached frame on the next call, and
+    // the client may still be rendering from this one.
+    CMSampleBufferRef frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:YES];
+    if (frame == NULL) return;
+    if (g_photoFrame != NULL) CFRelease(g_photoFrame);
+    g_photoFrame = frame;
+    CFRetain(g_photoFrame);
+
+    g_photoJPEG = vcam_jpeg_from_frame(g_photoFrame, g_photoOrientation);
+    if (g_photoJPEG == nil) return;
 
     if (g_photoHookedClasses == nil) g_photoHookedClasses = [NSMutableArray new];
     NSString *cls = NSStringFromClass([photo class]);
@@ -755,6 +799,15 @@ static void vcam_install_photo_overrides(id photo) {
             if (g_photoJPEG != nil) return g_photoJPEG;
             return origRep ? origRep(pself, _cmd) : nil;
         }), (IMP *)&origRep);
+
+    __block CVPixelBufferRef (*origPrev)(id, SEL) = NULL;
+    MSHookMessageEx([photo class], @selector(previewPixelBuffer),
+        imp_implementationWithBlock(^(id pself, SEL _cmd) {
+            CVPixelBufferRef pixels =
+                g_photoFrame ? CMSampleBufferGetImageBuffer(g_photoFrame) : NULL;
+            if (pixels != NULL) return pixels;
+            return origPrev ? origPrev(pself, _cmd) : NULL;
+        }), (IMP *)&origPrev);
 }
 
 %hook AVCapturePhotoOutput
