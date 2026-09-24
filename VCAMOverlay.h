@@ -51,8 +51,15 @@
 // across an app relaunch, were byte-identical and the second one was filed sharing
 // the first one's movie. One line per still, newest first, so a capture can be
 // moved on to a frame the library has not filed yet.
+//
+// The list is kept in the app's own container, not in /var/tmp: /var/tmp is
+// emptied by a reboot, and a forgotten list means filing a duplicate again. The
+// whole library is what a capture is matched against, so the list has to keep
+// every still handed over, however long ago — a plain count is nothing next to
+// the frames a looping clip can revisit.
+#define VCAM_STILL_SEEN_NAME @"Library/Application Support/VCAMLight/stills.seen"
 #define VCAM_STILL_SEEN_PATH @"/var/tmp/vcamlight/last_stills"
-#define VCAM_STILL_SEEN_KEEP 16
+#define VCAM_STILL_SEEN_KEEP 512
 
 @interface VCAMOverlay : NSObject
 + (instancetype)shared;

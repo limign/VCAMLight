@@ -420,29 +420,45 @@ static NSString *vcam_still_stamp(NSData *jpeg) {
     return [NSString stringWithFormat:@"%016llx-%lu", hash, (unsigned long)jpeg.length];
 }
 
-static NSArray<NSString *> *vcam_still_seen_list(void) {
-    NSString *seen = [NSString stringWithContentsOfFile:VCAM_STILL_SEEN_PATH
-                                               encoding:NSUTF8StringEncoding error:nil];
-    if (seen == nil) return @[];
-    NSMutableArray<NSString *> *lines = [NSMutableArray array];
-    for (NSString *line in [seen componentsSeparatedByString:@"\n"]) {
-        if (line.length > 0) [lines addObject:line];
+// The app's own container survives a reboot, which /var/tmp does not; a still
+// handed over before the reboot has to keep counting after it.
+static NSString *vcam_seen_path(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:VCAM_STILL_SEEN_NAME];
+    NSString *dir = [path stringByDeletingLastPathComponent];
+    if ([fm fileExistsAtPath:dir] ||
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil]) {
+        return path;
     }
-    return lines;
+
+    [fm createDirectoryAtPath:VCAM_PLAYBACK_DIR
+  withIntermediateDirectories:YES attributes:nil error:nil];
+    return VCAM_STILL_SEEN_PATH;
+}
+
+// Read once and held: every still consults it, and only the writes below change
+// it. Messaging nil for the file's text gives nil, and enumerating that is a
+// no-op, so a first run with no list yet falls straight through.
+static NSMutableArray<NSString *> *vcam_seen_stamps(void) {
+    static NSMutableArray<NSString *> *stamps = nil;
+    if (stamps != nil) return stamps;
+
+    stamps = [NSMutableArray array];
+    NSString *text = [NSString stringWithContentsOfFile:vcam_seen_path()
+                                               encoding:NSUTF8StringEncoding error:nil];
+    for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+        if (line.length > 0) [stamps addObject:line];
+    }
+    return stamps;
 }
 
 static void vcam_still_remember(NSString *stamp) {
-    NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithObject:stamp];
-    for (NSString *line in vcam_still_seen_list()) {
-        if ([line isEqualToString:stamp]) continue;
-        [lines addObject:line];
-        if (lines.count >= (NSUInteger)VCAM_STILL_SEEN_KEEP) break;
-    }
+    NSMutableArray<NSString *> *stamps = vcam_seen_stamps();
+    [stamps removeObject:stamp];
+    [stamps insertObject:stamp atIndex:0];
+    while (stamps.count > (NSUInteger)VCAM_STILL_SEEN_KEEP) [stamps removeLastObject];
 
-    NSFileManager *fm = [NSFileManager defaultManager];
-    [fm createDirectoryAtPath:VCAM_PLAYBACK_DIR
-  withIntermediateDirectories:YES attributes:nil error:nil];
-    [[lines componentsJoinedByString:@"\n"] writeToFile:VCAM_STILL_SEEN_PATH
+    [[stamps componentsJoinedByString:@"\n"] writeToFile:vcam_seen_path()
                                              atomically:YES
                                                encoding:NSUTF8StringEncoding
                                                   error:nil];
@@ -456,23 +472,32 @@ static void vcam_still_remember(NSString *stamp) {
 // holds and files a repeat as a *duplicate*, and a duplicate of a Live Photo
 // carries that asset's movie along with it — a real-scene movie from an earlier
 // capture came back under our photo that way. Since only the picture matters,
-// stepping the clip on to the next frame is enough to be a new photo. The list
+// stepping the clip on to another frame is enough to be a new photo. The list
 // outlives the process because the still that collided had been captured before
 // the app was last relaunched.
+//
+// A step of one frame each try would be no escape at all: captures come in
+// bursts, and a burst leaves the library holding a run of consecutive frames.
+// Each retry skips well past a run instead, rendering only the frame it lands
+// on — the skips are just reads.
 static NSData *vcam_still_jpeg(CMSampleBufferRef *frameOut) {
-    NSArray<NSString *> *seen = vcam_still_seen_list();
     CMSampleBufferRef frame = NULL;
     NSData *jpeg = nil;
     NSString *stamp = nil;
 
-    for (int attempt = 0; attempt < 6; attempt++) {
+    for (int attempt = 0; attempt < 8; attempt++) {
+        if (attempt > 0) {
+            for (int skip = 0; skip < 12; skip++) {
+                if ([VCAMFrameSource nextFrameForBuffer:NULL forceRenew:YES] == NULL) break;
+            }
+        }
         frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:YES];
         if (frame == NULL) return nil;
         jpeg = vcam_jpeg_from_frame(frame, g_photoOrientation);
         if (jpeg == nil) return nil;
 
         stamp = vcam_still_stamp(jpeg);
-        if (![seen containsObject:stamp]) break;
+        if (![vcam_seen_stamps() containsObject:stamp]) break;
     }
 
     vcam_still_remember(stamp);
