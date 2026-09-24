@@ -69,6 +69,13 @@ static NSUInteger g_pTick, g_pIdleOff, g_pIdleNotOurs, g_pIdleVDO;
 static NSUInteger g_pFrame, g_pNull, g_pEnq, g_pRefused, g_pFlush;
 static NSUInteger g_pEof, g_pLoop, g_pReopen, g_pReload;
 static NSTimeInterval g_pNextReport = 0, g_pLastPTS = -1, g_pLastClock = 0;
+// Geometry, for the report only: the box the picture is being drawn into, the
+// box the app's own preview uses, the frame's own size, and which gravity each
+// layer was told to fill it with.
+static NSUInteger g_pBufW, g_pBufH;
+static CGFloat g_pOursW, g_pOursH, g_pAppW, g_pAppH;
+static NSString *g_pGrav = nil, *g_pAppGrav = nil;
+static NSInteger g_pOrient = 0;
 
 // Mirrors of prefs.plist, re-read at most once a second so that toggling the
 // switch in the overlay takes effect in already-running apps without a respring.
@@ -774,7 +781,8 @@ static void vcam_preview_report(NSTimeInterval now, const char *where) {
     vcam_live_note([NSString stringWithFormat:
         @"%@ preview %s ticks=%lu off=%lu other=%lu vdo=%lu frames=%lu null=%lu "
         @"enq=%lu refused=%lu flush=%lu eof=%lu loop=%lu reopen=%lu reload=%lu "
-        @"pts=%.3f clock=%.3f op=%.2f status=%ld ready=%d",
+        @"pts=%.3f clock=%.3f op=%.2f status=%ld ready=%d "
+        @"buf=%lux%lu ours=%.0fx%.0f app=%.0fx%.0f grav=%@ appgrav=%@ orient=%ld",
         [NSDate date], where,
         (unsigned long)g_pTick, (unsigned long)g_pIdleOff, (unsigned long)g_pIdleNotOurs,
         (unsigned long)g_pIdleVDO, (unsigned long)g_pFrame, (unsigned long)g_pNull,
@@ -782,7 +790,10 @@ static void vcam_preview_report(NSTimeInterval now, const char *where) {
         (unsigned long)g_pEof, (unsigned long)g_pLoop, (unsigned long)g_pReopen,
         (unsigned long)g_pReload, g_pLastPTS, g_pLastClock,
         (double)g_previewLayer.opacity, (long)g_previewLayer.status,
-        (int)g_previewLayer.readyForMoreMediaData]);
+        (int)g_previewLayer.readyForMoreMediaData,
+        (unsigned long)g_pBufW, (unsigned long)g_pBufH,
+        g_pOursW, g_pOursH, g_pAppW, g_pAppH, g_pGrav, g_pAppGrav,
+        (long)g_pOrient]);
 
     g_pTick = g_pIdleOff = g_pIdleNotOurs = g_pIdleVDO = 0;
     g_pFrame = g_pNull = g_pEnq = g_pRefused = g_pFlush = 0;
@@ -846,6 +857,13 @@ static void vcam_preview_report(NSTimeInterval now, const char *where) {
 - (void)vcam_step:(CADisplayLink *)sender {
     if (g_previewLayer == nil || g_maskLayer == nil) return;
     g_pTick++;
+    g_pAppW = self.bounds.size.width;
+    g_pAppH = self.bounds.size.height;
+    g_pOursW = g_previewLayer.frame.size.width;
+    g_pOursH = g_previewLayer.frame.size.height;
+    g_pAppGrav = self.videoGravity;
+    g_pGrav = g_previewLayer.videoGravity;
+    g_pOrient = (NSInteger)g_photoOrientation;
     vcam_preview_report(vcam_now_ms(), "link");
     // Another preview layer owns the shared display layer right now.
     if (g_previewLayer.superlayer != self) { g_pIdleNotOurs++; return; }
@@ -863,6 +881,13 @@ static void vcam_preview_report(NSTimeInterval now, const char *where) {
     }
 
     g_previewLayer.frame = self.bounds;
+    // Whatever gravity the app gave its own preview, ours has to match. Left on
+    // the display layer's default (resizeAspect) ours letterboxes the clip inside
+    // a box the camera fills edge to edge, because the app's layer is set to fill
+    // and a display layer is not. Matching the app is also the only correct
+    // choice when the aspects really do differ: the app is what decides how its
+    // own picture is cropped.
+    g_previewLayer.videoGravity = self.videoGravity ?: AVLayerVideoGravityResizeAspectFill;
     switch (g_photoOrientation) {
         case AVCaptureVideoOrientationLandscapeRight:
             g_previewLayer.transform = CATransform3DMakeRotation(M_PI / 2, 0, 0, 1); break;
@@ -902,6 +927,11 @@ static void vcam_preview_report(NSTimeInterval now, const char *where) {
     g_pFrame++;
     g_pLastPTS = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(frame));
     g_pLastClock = CACurrentMediaTime();
+    CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(frame);
+    if (pixels != NULL) {
+        g_pBufW = CVPixelBufferGetWidth(pixels);
+        g_pBufH = CVPixelBufferGetHeight(pixels);
+    }
     g_lastPreviewFrame = now;
     g_maskLayer.opacity = 1;
     g_previewLayer.opacity = 1;
