@@ -773,6 +773,66 @@ static NSData *g_photoJPEG = nil;
 static CMSampleBufferRef g_photoFrame = NULL;   // keeps the pixels below alive
 static NSMutableArray *g_photoHookedClasses = nil;
 
+// The preview buffer is handed over in the camera's own geometry, not in the
+// upright one the file is stored in. Measured on the test device: the framework
+// produced an 852x640 buffer for a preview request that named no dimensions, and
+// for its own captures the Camera app asks for 2208x1242 — landscape both times,
+// with the phone held in portrait. What turns it upright is the client, using
+// the capture's orientation (EXIF 6 here, a quarter turn clockwise). So a buffer
+// that arrives already upright leaves the app's own turn to do, and the corner
+// thumbnail comes out on its side — which is what the substituted frame did.
+// Turning the frame the other way ourselves lands the app's turn upright, and
+// the buffer is built at the size the app asked for.
+static CVPixelBufferRef g_photoPreview = NULL;
+static size_t g_previewWidth = 0, g_previewHeight = 0;
+
+static CVPixelBufferRef vcam_preview_buffer(CMSampleBufferRef frame) {
+    CVImageBufferRef pixels = frame ? CMSampleBufferGetImageBuffer(frame) : NULL;
+    if (pixels == NULL) return NULL;
+
+    size_t srcW = CVPixelBufferGetWidth(pixels);
+    size_t srcH = CVPixelBufferGetHeight(pixels);
+    // The shape the app asked for when it named one, the frame's own turned on
+    // its side otherwise. On this camera the two agree on aspect to within a
+    // rounding, so neither path stretches the picture.
+    size_t outW = g_previewWidth  ? g_previewWidth  : srcH;
+    size_t outH = g_previewHeight ? g_previewHeight : srcW;
+    if (outW == 0 || outH == 0) return NULL;
+
+    CIImage *ci = [CIImage imageWithCVImageBuffer:pixels];
+    if (ci == nil) return NULL;
+    // The orientation the camera stamps into its own captures. Applying it bakes
+    // the quarter turn into the pixels, which is the geometry the app expects.
+    // The transform below is the same quarter turn, for builds without it.
+    if ([ci respondsToSelector:@selector(imageByApplyingOrientation:)]) {
+        ci = [ci imageByApplyingOrientation:6];
+    } else {
+        ci = [ci imageByApplyingTransform:CGAffineTransformMake(0, 1, -1, 0, srcH, 0)];
+    }
+
+    // Scaled to the target shape here rather than left to the render call, so
+    // the result is the same whether bounds is read as "scale this region into
+    // the buffer" or "copy this region into the buffer".
+    CGRect extent = ci.extent;
+    if (extent.size.width <= 0 || extent.size.height <= 0) return NULL;
+    ci = [ci imageByApplyingTransform:CGAffineTransformMakeScale(outW / extent.size.width,
+                                                                outH / extent.size.height)];
+
+    NSDictionary *attrs = @{ (__bridge id)kCVPixelBufferIOSurfacePropertiesKey: @{} };
+    CVPixelBufferRef dest = NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, outW, outH, kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)attrs, &dest) != kCVReturnSuccess) {
+        return NULL;
+    }
+
+    static CIContext *ctx = nil;
+    if (ctx == nil) ctx = [CIContext contextWithOptions:nil];
+    static CGColorSpaceRef space = NULL;
+    if (space == NULL) space = CGColorSpaceCreateDeviceRGB();
+    [ctx render:ci toCVPixelBuffer:dest bounds:CGRectMake(0, 0, outW, outH) colorSpace:space];
+    return dest;
+}
+
 static void vcam_install_photo_overrides(id photo) {
     if (photo == nil) return;
 
@@ -784,6 +844,14 @@ static void vcam_install_photo_overrides(id photo) {
     if (g_photoFrame != NULL) CFRelease(g_photoFrame);
     g_photoFrame = frame;
     CFRetain(g_photoFrame);
+
+    // The previous capture's buffer is only released now: the thumbnail of the
+    // one before it may still be on screen.
+    if (g_photoPreview != NULL) {
+        CVPixelBufferRelease(g_photoPreview);
+        g_photoPreview = NULL;
+    }
+    g_photoPreview = vcam_preview_buffer(g_photoFrame);
 
     g_photoJPEG = vcam_jpeg_from_frame(g_photoFrame, g_photoOrientation);
     if (g_photoJPEG == nil) return;
@@ -803,9 +871,7 @@ static void vcam_install_photo_overrides(id photo) {
     __block CVPixelBufferRef (*origPrev)(id, SEL) = NULL;
     MSHookMessageEx([photo class], @selector(previewPixelBuffer),
         imp_implementationWithBlock(^(id pself, SEL _cmd) {
-            CVPixelBufferRef pixels =
-                g_photoFrame ? CMSampleBufferGetImageBuffer(g_photoFrame) : NULL;
-            if (pixels != NULL) return pixels;
+            if (g_photoPreview != NULL) return g_photoPreview;
             return origPrev ? origPrev(pself, _cmd) : NULL;
         }), (IMP *)&origPrev);
 }
@@ -821,6 +887,19 @@ static void vcam_install_photo_overrides(id photo) {
 - (void)capturePhotoWithSettings:(AVCapturePhotoSettings *)settings
                         delegate:(id<AVCapturePhotoCaptureDelegate>)delegate {
     if (settings != nil && delegate != nil) {
+        // The shape the client wants its preview back in. Measured here: the
+        // Camera app names one (2208x1242) while the framework picks a
+        // display-sized one (852x640) when nothing is named.
+        NSDictionary *previewFormat = settings.previewPhotoFormat;
+        if (previewFormat != nil) {
+            NSNumber *width = previewFormat[(id)kCVPixelBufferWidthKey];
+            NSNumber *height = previewFormat[(id)kCVPixelBufferHeightKey];
+            if (width != nil && height != nil) {
+                g_previewWidth = width.unsignedIntegerValue;
+                g_previewHeight = height.unsignedIntegerValue;
+            }
+        }
+
         static NSMutableArray *hookedClasses = nil;
         if (hookedClasses == nil) hookedClasses = [NSMutableArray new];
         NSString *cls = NSStringFromClass([delegate class]);
