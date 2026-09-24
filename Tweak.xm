@@ -144,14 +144,9 @@ static NSString *vcam_master_stamp(void) {
             master[NSFileModificationDate]];
 }
 
-@implementation VCAMFrameSource
-
-// The media daemon behind AVAssetReader only opens paths this app's sandbox
-// already covers, so the master under Media/.vcamlight cannot be decoded from in
-// here (OSStatus -17507) even though its bytes read back fine. Stage a copy in
-// /var/tmp, which is covered, and decode that. Cheap to re-run: a sidecar records
-// which master revision the copy came from.
-+ (NSString *)playbackPath {
+// The staged copy of the master, made on first use and remade when the master
+// changes. nil when there is no master, or when its bytes cannot be read.
+static NSString *vcam_stage_clip(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *stamp = vcam_master_stamp();
     if (stamp == nil) return nil;
@@ -175,12 +170,28 @@ static NSString *vcam_master_stamp(void) {
     [stamp writeToFile:VCAM_PLAYBACK_STAMP
             atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
+    return VCAM_PLAYBACK_PATH;
+}
+
+@implementation VCAMFrameSource
+
+// The media daemon behind AVAssetReader only opens paths this app's sandbox
+// already covers, so the master under Media/.vcamlight cannot be decoded from in
+// here (OSStatus -17507) even though its bytes read back fine. Stage a copy in
+// /var/tmp, which is covered, and decode that. Cheap to re-run: a sidecar records
+// which master revision the copy came from.
++ (NSString *)playbackPath {
+    NSString *playback = vcam_stage_clip();
+    if (playback == nil) return nil;
+
     // Start the HEVC copy now, while the user is still lining up a shot, instead
-    // of at the first Live Photo, where it would arrive too late to be used. The
-    // nested playbackPath call returns on the stamp just written.
+    // of at the first Live Photo, where it would arrive too late to be used. Every
+    // call is one, cheap: with the copy already made this returns at the stamp,
+    // and with a staged clip already on disk it still starts a missing encode —
+    // which is what a freshly installed build finds.
     [self liveMoviePath];
 
-    return VCAM_PLAYBACK_PATH;
+    return playback;
 }
 
 // The staged clip re-encoded to HEVC, which is what a Live Photo's movie has to
@@ -205,7 +216,9 @@ static NSString *vcam_master_stamp(void) {
     static NSString *encoding = nil;
     if ([encoding isEqualToString:stamp]) return nil;
 
-    NSString *source = [self playbackPath];
+    // The staged clip, not +playbackPath: that one calls back into here to keep a
+    // missing encode from waiting for the master to change.
+    NSString *source = vcam_stage_clip();
     if (source == nil) return nil;
 
     [fm createDirectoryAtPath:VCAM_PLAYBACK_DIR
