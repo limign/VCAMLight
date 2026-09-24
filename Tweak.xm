@@ -1043,19 +1043,101 @@ static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(
     vcam_export_clip(appURL, length, done);
 }
 
+// AVMediaTypeMetadata, which the SDK in use does not declare. Measured on the
+// device: a Live Photo's movie reports "meta" for each of its metadata tracks.
+static NSString *const VCAMMediaTypeMeta = @"meta";
+
 // The movie beside a Live Photo. It is written by the camera daemon, not by this
 // process — the frames of a Live Photo movie never pass through an app — so it
 // gets the same treatment as a recording: whatever landed where the app expects
 // its movie is replaced by the clip, cut to the movie's own length so the Live
 // Photo keeps its shape.
+//
+// A Live Photo's movie is not just any movie, though. Measured on the device: the
+// one the daemon writes carries three metadata tracks beside its picture and its
+// sound, and the library reads those to accept the movie as this photo's other
+// half. A movie exported from the clip alone has none of them, and the pair is
+// refused: the still is filed on its own and the movie is left behind in
+// `DCIM/.MISC/Incoming`. So the metadata tracks and the top-level metadata — the
+// identifier among them — are carried over from the movie the daemon just wrote.
+//
+// The result is then written back over that file in place rather than swapped in
+// as a new one, so the file the library watched the daemon create is still there.
 static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
-    if (url == nil || [VCAMFrameSource playbackPath] == nil) { done(NO); return; }
+    NSString *source = [VCAMFrameSource playbackPath];
+    if (url == nil || source == nil) { done(NO); return; }
 
-    CMTime length = kCMTimeInvalid;
     AVURLAsset *movie = [AVURLAsset URLAssetWithURL:url options:nil];
-    if (movie != nil) length = movie.duration;
+    AVURLAsset *clip = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:source] options:nil];
 
-    vcam_export_clip(url, length, done);
+    CMTime clipLength = clip.duration;
+    CMTime movieLength = movie.duration;
+    CMTime length = clipLength;
+    if (CMTIME_IS_NUMERIC(movieLength) && CMTIME_IS_NUMERIC(clipLength) &&
+        CMTimeCompare(movieLength, kCMTimeZero) > 0 &&
+        CMTimeCompare(movieLength, clipLength) < 0) {
+        length = movieLength;
+    }
+    if (!CMTIME_IS_NUMERIC(length) || CMTimeCompare(length, kCMTimeZero) <= 0) {
+        done(NO);
+        return;
+    }
+    CMTimeRange range = CMTimeRangeMake(kCMTimeZero, length);
+
+    AVMutableComposition *comp = [AVMutableComposition composition];
+    NSError *error = nil;
+    for (AVAssetTrack *track in clip.tracks) {
+        if (![track.mediaType isEqualToString:AVMediaTypeVideo] &&
+            ![track.mediaType isEqualToString:AVMediaTypeAudio]) {
+            continue;
+        }
+        AVMutableCompositionTrack *added =
+            [comp addMutableTrackWithMediaType:track.mediaType
+                            preferredTrackID:kCMPersistentTrackID_Invalid];
+        [added insertTimeRange:range ofTrack:track atTime:kCMTimeZero error:&error];
+    }
+    for (AVAssetTrack *track in movie.tracks) {
+        if (![track.mediaType isEqualToString:VCAMMediaTypeMeta]) continue;
+        AVMutableCompositionTrack *added =
+            [comp addMutableTrackWithMediaType:track.mediaType
+                            preferredTrackID:kCMPersistentTrackID_Invalid];
+        CMTime trackLength = track.timeRange.duration;
+        CMTime take = (CMTimeCompare(trackLength, length) < 0) ? trackLength : length;
+        [added insertTimeRange:CMTimeRangeMake(kCMTimeZero, take)
+                       ofTrack:track atTime:kCMTimeZero error:&error];
+    }
+
+    NSURL *temp = [NSURL fileURLWithPath:
+                   [NSTemporaryDirectory() stringByAppendingPathComponent:@"vcam_live_movie.mov"]];
+
+    AVAssetExportSession *writer =
+        [AVAssetExportSession exportSessionWithAsset:comp
+                                          presetName:AVAssetExportPresetPassthrough];
+    if (writer == nil) {
+        // Nothing to carry the metadata with. A movie the library will not pair
+        // with its photo still beats no movie at all.
+        vcam_export_clip(url, length, done);
+        return;
+    }
+    writer.outputURL = temp;
+    writer.outputFileType = AVFileTypeQuickTimeMovie;
+    writer.metadata = movie.metadata;
+    writer.timeRange = CMTimeRangeMake(kCMTimeZero, length);
+
+    [writer exportAsynchronouslyWithCompletionHandler:^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL ok = (writer.status == AVAssetExportSessionStatusCompleted);
+        if (ok) {
+            NSData *bytes = [NSData dataWithContentsOfURL:temp];
+            ok = (bytes != nil) && [bytes writeToFile:url.path atomically:NO];
+            if (!ok) {
+                [fm removeItemAtURL:url error:nil];
+                ok = [fm moveItemAtURL:temp toURL:url error:nil];
+            }
+        }
+        [fm removeItemAtURL:temp error:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{ done(ok); });
+    }];
 }
 
 %hook AVCaptureMovieFileOutput
