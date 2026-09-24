@@ -348,12 +348,7 @@ static NSString *vcam_stage_clip(void) {
 // own timestamp bookkeeping keeps working, and carries the EXIF/TIFF
 // attachments across.
 //
-// Only ever called with a source buffer. A frame handed to the display layer
-// with no source keeps the clip's own presentation time — measured the hard way:
-// stamping it with the wall clock instead puts a PTS of ~1.79e9 seconds on a
-// layer whose clock is the host clock, the layer queues the frame for the year
-// 2026, its queue fills, it stops accepting more, and the preview freezes on the
-// first frame while every tick still reports itself as showing one.
+// Only ever called with a source buffer.
 + (CMSampleBufferRef)rewrap:(CMSampleBufferRef)decoded
                      origin:(CMSampleBufferRef)originSampleBuffer {
     CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(decoded);
@@ -381,6 +376,44 @@ static NSString *vcam_stage_clip(void) {
     if (exif) CMSetAttachment(wrapped, (CFStringRef)@"{Exif}", exif, kCMAttachmentMode_ShouldPropagate);
     if (tiff) CMSetAttachment(wrapped, (CFStringRef)@"{TIFF}", tiff, kCMAttachmentMode_ShouldPropagate);
     return wrapped;
+}
+
+// The same frame stamped with the host clock, for the one caller that has no
+// source buffer: the display layer fed from a CADisplayLink.
+//
+// A display layer schedules against the host clock and will not go back — it
+// renders a frame whose time is later than the one it last showed, and drops the
+// rest. Left on the clip's own times, the last frame of a pass is the newest
+// time the layer ever sees, so the loop restarts into times it has already
+// passed and nothing is ever rendered again. Measured with the engine's own
+// counters: the preview froze on the last frame of the first pass while the
+// display link kept ticking 60 times a second, the engine kept handing over 60
+// frames a second, the layer kept accepting every one of them (status=1,
+// readyForMoreMediaData=1, refused=0) and the reader kept looping cleanly every
+// 6.3s. Every number healthy, picture dead.
+//
+// The host clock is also the clock the camera's own buffers arrive on, so this
+// is the same timeline the layer already runs on. Wall-clock milliseconds are
+// what must not be used: read as seconds they are ~1.79e9, fifty years out, and
+// the layer queues the frame for the year 2026 and stops taking any more.
++ (CMSampleBufferRef)restamp:(CMSampleBufferRef)decoded {
+    CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(decoded);
+    if (pixels == NULL) return NULL;
+
+    CMSampleTimingInfo timing = {
+        .duration = CMTimeMakeWithSeconds(g_frameInterval, 600),
+        .presentationTimeStamp = CMTimeMakeWithSeconds(CACurrentMediaTime(), 600),
+        .decodeTimeStamp = kCMTimeInvalid,
+    };
+    CMVideoFormatDescriptionRef vfmt = NULL;
+    CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixels, &vfmt);
+    if (vfmt == NULL) return NULL;
+
+    CMSampleBufferRef stamped = NULL;
+    CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixels, true, NULL, NULL,
+                                       vfmt, &timing, &stamped);
+    CFRelease(vfmt);
+    return stamped;
 }
 
 + (CMSampleBufferRef)nextFrameForBuffer:(CMSampleBufferRef)originSampleBuffer
@@ -468,9 +501,16 @@ static NSString *vcam_stage_clip(void) {
 
     CMSampleBufferRef result = decoded;
     if (originSampleBuffer != NULL) {
-        // Preview frames are left exactly as the reader produced them. See
-        // +rewrap: for why they must not be stamped with the wall clock.
         result = [self rewrap:decoded origin:originSampleBuffer];
+        CFRelease(decoded);
+        if (result == NULL) return NULL;
+    } else if (!forceRenew) {
+        // The unaccompanied caller is the display link, whose layer reads the
+        // time against the host clock: see +restamp for what it does with the
+        // clip's own times at the end of the first pass. The still path also
+        // asks without a buffer, but with forceRenew, and converts to a pixel
+        // buffer without caring what the frame is stamped.
+        result = [self restamp:decoded];
         CFRelease(decoded);
         if (result == NULL) return NULL;
     }
