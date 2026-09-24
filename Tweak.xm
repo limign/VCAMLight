@@ -37,6 +37,8 @@
 
 static BOOL vcam_active(void);
 static NSData *vcam_jpeg_from_current_frame(void);
+// Defined with the recording path, called from the photo delegate above it.
+static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced));
 
 #pragma mark - Shared state
 
