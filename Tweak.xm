@@ -36,7 +36,8 @@
 #pragma mark - Forward declarations
 
 static BOOL vcam_active(void);
-static NSData *vcam_jpeg_from_current_frame(void);
+// Defined with the still helpers, called from the still paths below them.
+static NSData *vcam_still_jpeg(CMSampleBufferRef *frameOut);
 // Defined with the recording path, called from the photo delegate above it.
 static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced));
 
@@ -406,12 +407,77 @@ static NSData *vcam_jpeg_from_frame(CMSampleBufferRef frame,
     return UIImageJPEGRepresentation(img, 1.0);
 }
 
-// Renders the current replacement frame to JPEG. forceRenew: the still path runs
-// off the capture queue, not the display link, so it must not be told "not due
-// yet" and hand back nothing.
-static NSData *vcam_jpeg_from_current_frame(void) {
-    CMSampleBufferRef frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:YES];
-    return vcam_jpeg_from_frame(frame, g_photoOrientation);
+// A fingerprint of one still, for the "already filed" list. Not a hash for
+// security: it only has to tell two of our own JPEGs apart, and a still is close
+// to a megabyte, so FNV-1a over the bytes is enough and needs no import.
+static NSString *vcam_still_stamp(NSData *jpeg) {
+    uint64_t hash = 1469598103934665603ULL;
+    const uint8_t *bytes = (const uint8_t *)jpeg.bytes;
+    for (NSUInteger i = 0; i < jpeg.length; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    return [NSString stringWithFormat:@"%016llx-%lu", hash, (unsigned long)jpeg.length];
+}
+
+static NSArray<NSString *> *vcam_still_seen_list(void) {
+    NSString *seen = [NSString stringWithContentsOfFile:VCAM_STILL_SEEN_PATH
+                                               encoding:NSUTF8StringEncoding error:nil];
+    if (seen == nil) return @[];
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    for (NSString *line in [seen componentsSeparatedByString:@"\n"]) {
+        if (line.length > 0) [lines addObject:line];
+    }
+    return lines;
+}
+
+static void vcam_still_remember(NSString *stamp) {
+    NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithObject:stamp];
+    for (NSString *line in vcam_still_seen_list()) {
+        if ([line isEqualToString:stamp]) continue;
+        [lines addObject:line];
+        if (lines.count >= (NSUInteger)VCAM_STILL_SEEN_KEEP) break;
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:VCAM_PLAYBACK_DIR
+  withIntermediateDirectories:YES attributes:nil error:nil];
+    [[lines componentsJoinedByString:@"\n"] writeToFile:VCAM_STILL_SEEN_PATH
+                                             atomically:YES
+                                               encoding:NSUTF8StringEncoding
+                                                  error:nil];
+}
+
+// Renders a still the library has not filed yet, and hands back the frame it
+// came from. forceRenew: the still path runs off the capture queue, not the
+// display link, so it must not be told "not due yet" and hand back nothing.
+//
+// Why the retry: the library matches a capture against the stills it already
+// holds and files a repeat as a *duplicate*, and a duplicate of a Live Photo
+// carries that asset's movie along with it — a real-scene movie from an earlier
+// capture came back under our photo that way. Since only the picture matters,
+// stepping the clip on to the next frame is enough to be a new photo. The list
+// outlives the process because the still that collided had been captured before
+// the app was last relaunched.
+static NSData *vcam_still_jpeg(CMSampleBufferRef *frameOut) {
+    NSArray<NSString *> *seen = vcam_still_seen_list();
+    CMSampleBufferRef frame = NULL;
+    NSData *jpeg = nil;
+    NSString *stamp = nil;
+
+    for (int attempt = 0; attempt < 6; attempt++) {
+        frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:YES];
+        if (frame == NULL) return nil;
+        jpeg = vcam_jpeg_from_frame(frame, g_photoOrientation);
+        if (jpeg == nil) return nil;
+
+        stamp = vcam_still_stamp(jpeg);
+        if (![seen containsObject:stamp]) break;
+    }
+
+    vcam_still_remember(stamp);
+    if (frameOut != NULL) *frameOut = frame;
+    return jpeg;
 }
 
 #pragma mark - Preview replacement
@@ -755,7 +821,7 @@ static NSArray *vcam_metadata_objects(NSArray *objects) {
 }
 
 + (NSData *)jpegStillImageNSDataRepresentation:(CMSampleBufferRef)jpegSampleBuffer {
-    NSData *replaced = vcam_jpeg_from_current_frame();
+    NSData *replaced = vcam_still_jpeg(NULL);
     return replaced ?: %orig;
 }
 
@@ -845,8 +911,9 @@ static void vcam_install_photo_overrides(id photo) {
     // One frame serves both the file and the thumbnail. Held rather than used
     // and dropped: the engine releases its cached frame on the next call, and
     // the client may still be rendering from this one.
-    CMSampleBufferRef frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:YES];
-    if (frame == NULL) return;
+    CMSampleBufferRef frame = NULL;
+    NSData *jpeg = vcam_still_jpeg(&frame);
+    if (frame == NULL || jpeg == nil) return;
     if (g_photoFrame != NULL) CFRelease(g_photoFrame);
     g_photoFrame = frame;
     CFRetain(g_photoFrame);
@@ -859,8 +926,7 @@ static void vcam_install_photo_overrides(id photo) {
     }
     g_photoPreview = vcam_preview_buffer(g_photoFrame);
 
-    g_photoJPEG = vcam_jpeg_from_frame(g_photoFrame, g_photoOrientation);
-    if (g_photoJPEG == nil) return;
+    g_photoJPEG = jpeg;
 
     if (g_photoHookedClasses == nil) g_photoHookedClasses = [NSMutableArray new];
     NSString *cls = NSStringFromClass([photo class]);
@@ -886,7 +952,7 @@ static void vcam_install_photo_overrides(id photo) {
 
 + (NSData *)JPEGPhotoDataRepresentationForJPEGSampleBuffer:(CMSampleBufferRef)JPEGSampleBuffer
                                     previewPhotoSampleBuffer:(CMSampleBufferRef)previewPhotoSampleBuffer {
-    NSData *replaced = vcam_jpeg_from_current_frame();
+    NSData *replaced = vcam_still_jpeg(NULL);
     return replaced ?: %orig;
 }
 

@@ -43,6 +43,17 @@
 #define VCAM_PLAYBACK_PATH  @"/var/tmp/vcamlight/selected.mov"
 #define VCAM_PLAYBACK_STAMP @"/var/tmp/vcamlight/stamp"
 
+// ── Stills already handed to the library ──────────────────────────────────────
+// Photos files a capture whose still it has already seen as a *duplicate* of that
+// asset, and a duplicate of a Live Photo comes with the other asset's movie. The
+// clip loops and a still is taken from wherever the preview had got to, so two
+// captures do land on the same frame — measured: two stills 83 minutes apart,
+// across an app relaunch, were byte-identical and the second one was filed sharing
+// the first one's movie. One line per still, newest first, so a capture can be
+// moved on to a frame the library has not filed yet.
+#define VCAM_STILL_SEEN_PATH @"/var/tmp/vcamlight/last_stills"
+#define VCAM_STILL_SEEN_KEEP 16
+
 @interface VCAMOverlay : NSObject
 + (instancetype)shared;
 + (void)toggle;
