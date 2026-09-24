@@ -1429,9 +1429,15 @@ static void vcam_install_photo_overrides(id photo) {
 static NSMutableDictionary *g_recordingURLs = nil;
 static NSUInteger g_recordingSeq = 0;
 
-// Puts the chosen clip at `appURL`, cut to at most `length`, then reports on the
-// main queue — where AVCaptureFileOutput delivers its delegate calls and where
-// the app reads the file back.
+// Puts the chosen clip at `appURL`, at the length that was recorded, then reports
+// on the main queue — where AVCaptureFileOutput delivers its delegate calls and
+// where the app reads the file back.
+//
+// Shorter than the clip, the recording is cut; longer, the clip is repeated until
+// it fills the recording. That is what the preview already does — the overlay
+// loops the clip — so anything else makes the file disagree with what was on
+// screen while it was being taken: a ten-second recording came back as six
+// seconds of video because the clip is six seconds long.
 static void vcam_export_clip(NSURL *appURL, CMTime length, void (^done)(BOOL replaced)) {
     NSString *source = [VCAMFrameSource playbackPath];
     if (source == nil) { done(NO); return; }
@@ -1440,11 +1446,58 @@ static void vcam_export_clip(NSURL *appURL, CMTime length, void (^done)(BOOL rep
     [fm removeItemAtURL:appURL error:nil];
 
     AVURLAsset *sourceAsset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:source] options:nil];
+    CMTime sourceLength = sourceAsset.duration;
+
+    BOOL recorded = (CMTIME_IS_NUMERIC(length) && CMTimeCompare(length, kCMTimeZero) > 0);
+    AVAsset *asset = sourceAsset;
+
+    if (recorded && CMTIME_IS_NUMERIC(sourceLength) &&
+        CMTimeCompare(sourceLength, kCMTimeZero) > 0 &&
+        CMTimeCompare(length, sourceLength) > 0) {
+        AVMutableComposition *looped = [AVMutableComposition composition];
+        AVAssetTrack *videoIn = [[sourceAsset tracksWithMediaType:AVMediaTypeVideo] firstObject];
+        AVAssetTrack *audioIn = [[sourceAsset tracksWithMediaType:AVMediaTypeAudio] firstObject];
+        AVMutableCompositionTrack *video =
+            (videoIn != nil) ? [looped addMutableTrackWithMediaType:AVMediaTypeVideo
+                                                       preferredTrackID:kCMPersistentTrackID_Invalid]
+                             : nil;
+        AVMutableCompositionTrack *audio =
+            (audioIn != nil) ? [looped addMutableTrackWithMediaType:AVMediaTypeAudio
+                                                       preferredTrackID:kCMPersistentTrackID_Invalid]
+                             : nil;
+
+        BOOL inserted = (video != nil);
+        CMTime cursor = kCMTimeZero;
+        // The pass cap only matters if the clip's duration is nonsense-small; a
+        // normal clip needs one pass per repeat.
+        for (int pass = 0; inserted && pass < 600 && CMTimeCompare(cursor, length) < 0; pass++) {
+            CMTime remaining = CMTimeSubtract(length, cursor);
+            // Whole clip, except for the last pass which stops on the recording's
+            // own length.
+            CMTime segment = (CMTimeCompare(sourceLength, remaining) < 0) ? sourceLength : remaining;
+            inserted = [video insertTimeRange:CMTimeRangeMake(kCMTimeZero, segment)
+                                      ofTrack:videoIn
+                                       atTime:cursor
+                                        error:nil];
+            if (audio != nil) {
+                [audio insertTimeRange:CMTimeRangeMake(kCMTimeZero, segment)
+                               ofTrack:audioIn
+                                atTime:cursor
+                                 error:nil];
+            }
+            if (CMTIME_IS_NUMERIC(segment) && CMTimeCompare(segment, kCMTimeZero) > 0) {
+                cursor = CMTimeAdd(cursor, segment);
+            } else {
+                break;   // a zero-length pass would spin here forever
+            }
+        }
+        if (inserted) asset = looped;
+    }
 
     // Not named `export`: Theos compiles this file as Objective-C++, where that
     // is a keyword.
     AVAssetExportSession *writer =
-        [AVAssetExportSession exportSessionWithAsset:sourceAsset
+        [AVAssetExportSession exportSessionWithAsset:asset
                                           presetName:AVAssetExportPresetPassthrough];
     if (writer == nil) {
         BOOL copied = [fm copyItemAtPath:source toPath:appURL.path error:nil];
@@ -1458,7 +1511,9 @@ static void vcam_export_clip(NSURL *appURL, CMTime length, void (^done)(BOOL rep
     writer.outputURL = appURL;
     writer.outputFileType = [appURL.pathExtension.lowercaseString isEqualToString:@"mp4"]
                                 ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie;
-    if (CMTIME_IS_NUMERIC(length) && CMTimeCompare(length, kCMTimeZero) > 0) {
+    // The looped composition already ends where the recording did; only the plain
+    // clip needs trimming to it.
+    if (asset == sourceAsset && recorded) {
         writer.timeRange = CMTimeRangeMake(kCMTimeZero, length);
     }
 
@@ -1474,8 +1529,8 @@ static void vcam_export_clip(NSURL *appURL, CMTime length, void (^done)(BOOL rep
     }];
 }
 
-// The recording: the clip stands in for what was recorded, cut to the length
-// that was actually recorded.
+// The recording: the clip stands in for what was recorded, at the length that
+// was actually recorded — cut if the clip is longer, repeated if it is shorter.
 static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(BOOL replaced)) {
     NSString *source = [VCAMFrameSource playbackPath];
     if (source == nil) { done(NO); return; }
@@ -1485,12 +1540,14 @@ static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(
     CMTime sourceLength = sourceAsset.duration;
     CMTime recordedLength = recordedAsset.duration;
 
-    // The clip should not outlast the recording. An unreadable or zero length
-    // falls back to the whole clip rather than to a still.
+    // The recording's own length is what the file should be, both ways round: a
+    // recording longer than the clip is the clip repeated (the preview loops, so
+    // that is what was on screen), and a shorter one is the clip cut. An
+    // unreadable or zero length falls back to the whole clip rather than to a
+    // still.
     CMTime length = sourceLength;
-    if (CMTIME_IS_NUMERIC(recordedLength) && CMTIME_IS_NUMERIC(sourceLength) &&
-        CMTimeCompare(recordedLength, kCMTimeZero) > 0 &&
-        CMTimeCompare(recordedLength, sourceLength) < 0) {
+    if (CMTIME_IS_NUMERIC(recordedLength) &&
+        CMTimeCompare(recordedLength, kCMTimeZero) > 0) {
         length = recordedLength;
     }
 
