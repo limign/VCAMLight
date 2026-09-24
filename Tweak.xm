@@ -55,6 +55,21 @@ static NSTimeInterval g_lastEnqueueOk = 0;   // last time the display layer took
 static BOOL g_cameraRunning = NO;
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
 
+// ── Preview diagnostics ───────────────────────────────────────────────────────
+// The reported fault: the preview plays the clip through once and then holds on
+// one frame, while captures still follow the clip. Five different failures wear
+// that same face from the outside, and they need different fixes, so this counts
+// them apart — a display link that has stopped calling in (the log simply stops),
+// one that calls in and is handed nothing (ticks up, frames flat), one that is
+// handed frames the layer will not take (enq up, refused up), one where the
+// frames keep coming but their presentation times jump (pts), and one where the
+// reader dies at the loop point (eof up, reopen flat). A caller that logs the
+// real wall-clock time of the freeze turns the log into the whole answer.
+static NSUInteger g_pTick, g_pIdleOff, g_pIdleNotOurs, g_pIdleVDO;
+static NSUInteger g_pFrame, g_pNull, g_pEnq, g_pRefused, g_pFlush;
+static NSUInteger g_pEof, g_pLoop, g_pReopen, g_pReload;
+static NSTimeInterval g_pNextReport = 0, g_pLastPTS = -1, g_pLastClock = 0;
+
 // Mirrors of prefs.plist, re-read at most once a second so that toggling the
 // switch in the overlay takes effect in already-running apps without a respring.
 static BOOL g_replOn = NO;
@@ -66,6 +81,7 @@ static NSTimeInterval g_lastPrefsCheck = 0;
 static void vcam_reload_later(NSTimeInterval now) {
     g_bufferReload = YES;
     g_reloadNotBefore = now + 0.5;
+    g_pReload++;
 }
 
 static void vcam_reload_prefs(void) {
@@ -298,6 +314,7 @@ static NSString *vcam_stage_clip(void) {
     g_frameReader = reader;
     g_frameOutput = output;
     g_frameSubType = subType;
+    g_pReopen++;
     return YES;
 }
 
@@ -435,6 +452,7 @@ static NSString *vcam_stage_clip(void) {
     CMSampleBufferRef decoded = [g_frameOutput copyNextSampleBuffer];
 
     if (decoded == NULL) {
+        g_pEof++;
         // End of the clip. Restart it here rather than waiting for the next tick
         // to notice, which would drop the overlay for a moment at every loop.
         if (!g_loopOn) { g_replOn = NO; return NULL; }
@@ -442,6 +460,7 @@ static NSString *vcam_stage_clip(void) {
         // would ever rebuild it — ask for a full reload instead of returning
         // into a state that can only hand back NULL.
         if (![self openReaderForSubType:subType]) { g_bufferReload = YES; return NULL; }
+        g_pLoop++;
         g_nextFrameDue = 0;
         decoded = [g_frameOutput copyNextSampleBuffer];
         if (decoded == NULL) return NULL;
@@ -679,8 +698,10 @@ static NSTimeInterval vcam_now_ms(void) {
 // and show a black flash instead.
 static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBufferRef buf) {
     if (layer == nil || buf == NULL) return;
+    g_pEnq++;
     if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) {
         [layer flush];
+        g_pFlush++;
     }
     if (!layer.readyForMoreMediaData) {
         // Backed up. Normally that is just a slow tick and the next frame goes
@@ -688,16 +709,44 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
         // sit on a queue it never drains, reporting itself as rendering while it
         // shows nothing. Left alone that is permanent, so after a second of
         // refusing everything, flush the backlog away and try again.
+        g_pRefused++;
         NSTimeInterval now = vcam_now_ms();
         if (g_lastEnqueueOk == 0) g_lastEnqueueOk = now;
         if (now - g_lastEnqueueOk > 1000.0) {
             [layer flush];
+            g_pFlush++;
             g_lastEnqueueOk = now;
         }
         return;
     }
     g_lastEnqueueOk = vcam_now_ms();
     [layer enqueueSampleBuffer:buf];
+}
+
+// One line a second, whether or not anything came through, so a preview that
+// stops and a preview that is still being fed are told apart by whether the
+// lines stopped. Called from both paths that can drive the layer.
+static void vcam_preview_report(NSTimeInterval now, const char *where) {
+    if (g_pNextReport == 0) { g_pNextReport = now + 1000.0; return; }
+    if (now < g_pNextReport) return;
+    g_pNextReport = now + 1000.0;
+
+    vcam_live_note([NSString stringWithFormat:
+        @"%@ preview %s ticks=%lu off=%lu other=%lu vdo=%lu frames=%lu null=%lu "
+        @"enq=%lu refused=%lu flush=%lu eof=%lu loop=%lu reopen=%lu reload=%lu "
+        @"pts=%.3f clock=%.3f op=%.2f status=%ld ready=%d",
+        [NSDate date], where,
+        (unsigned long)g_pTick, (unsigned long)g_pIdleOff, (unsigned long)g_pIdleNotOurs,
+        (unsigned long)g_pIdleVDO, (unsigned long)g_pFrame, (unsigned long)g_pNull,
+        (unsigned long)g_pEnq, (unsigned long)g_pRefused, (unsigned long)g_pFlush,
+        (unsigned long)g_pEof, (unsigned long)g_pLoop, (unsigned long)g_pReopen,
+        (unsigned long)g_pReload, g_pLastPTS, g_pLastClock,
+        (double)g_previewLayer.opacity, (long)g_previewLayer.status,
+        (int)g_previewLayer.readyForMoreMediaData]);
+
+    g_pTick = g_pIdleOff = g_pIdleNotOurs = g_pIdleVDO = 0;
+    g_pFrame = g_pNull = g_pEnq = g_pRefused = g_pFlush = 0;
+    g_pEof = g_pLoop = g_pReopen = g_pReload = 0;
 }
 
 // AVCaptureVideoPreviewLayer renders the camera straight into its own layer, so
@@ -756,8 +805,10 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
 %new
 - (void)vcam_step:(CADisplayLink *)sender {
     if (g_previewLayer == nil || g_maskLayer == nil) return;
+    g_pTick++;
+    vcam_preview_report(vcam_now_ms(), "link");
     // Another preview layer owns the shared display layer right now.
-    if (g_previewLayer.superlayer != self) return;
+    if (g_previewLayer.superlayer != self) { g_pIdleNotOurs++; return; }
 
     // Cover the camera only while there is a replacement frame to cover it with.
     // The engine legitimately has nothing to hand over at times — no video chosen,
@@ -765,6 +816,7 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
     // preview is worse than no overlay at all, so an empty tick hides us.
     BOOL active = vcam_active() && g_cameraRunning;
     if (!active) {
+        g_pIdleOff++;
         g_maskLayer.opacity = 0;
         g_previewLayer.opacity = 0;
         return;
@@ -788,6 +840,7 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
     // clock, matching what the delegate above stamps.
     NSTimeInterval now = vcam_now_ms();
     if (now - g_lastVideoDataOutputTime < 1000) {
+        g_pIdleVDO++;
         g_maskLayer.opacity = 1;
         g_previewLayer.opacity = 1;
         return;
@@ -795,6 +848,7 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
 
     CMSampleBufferRef frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:NO];
     if (frame == NULL) {
+        g_pNull++;
         // The engine paces itself, so a NULL here is the normal case on most
         // ticks rather than a failure — the clip runs at its own frame rate
         // while this link ticks at screen rate. Only give up on the overlay
@@ -805,6 +859,9 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
         }
         return;
     }
+    g_pFrame++;
+    g_pLastPTS = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(frame));
+    g_pLastClock = CACurrentMediaTime();
     g_lastPreviewFrame = now;
     g_maskLayer.opacity = 1;
     g_previewLayer.opacity = 1;
@@ -861,8 +918,20 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
                                           AVCaptureConnection *connection) {
                 g_photoOrientation = [connection videoOrientation];
 
+                g_pTick++;
+                vcam_preview_report(vcam_now_ms(), "vdo");
+
                 CMSampleBufferRef replacement =
                     [VCAMFrameSource nextFrameForBuffer:sampleBuffer forceRenew:NO];
+
+                if (replacement == NULL) {
+                    g_pNull++;
+                } else {
+                    g_pFrame++;
+                    g_pLastPTS = CMTimeGetSeconds(
+                        CMSampleBufferGetPresentationTimeStamp(replacement));
+                    g_pLastClock = CACurrentMediaTime();
+                }
 
                 if (replacement != NULL && g_previewLayer != nil) {
                     vcam_enqueue_frame(g_previewLayer, replacement);
