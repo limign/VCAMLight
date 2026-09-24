@@ -27,6 +27,7 @@
 #import <notify.h>
 #import <objc/runtime.h>
 #import <substrate.h>
+#include <unistd.h>   // usleep, in the poster watch's poll loop
 
 // Theos compiles with -Werror, and hooking the legacy still-capture path means
 // naming AVCaptureStillImageOutput, which Apple deprecated in iOS 10 but still
@@ -1716,34 +1717,101 @@ static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
     }];
 }
 
-// The recording's poster frame — the still the library files beside the movie
-// and the corner thumbnail the app shows when the recording ends.
+// The recording's poster frame: the still the library files beside a movie, the
+// corner thumbnail the app shows when a recording ends, and — until this was
+// worked out — the apple that kept appearing under a movie that was the clip.
 //
-// The app does not take it from the movie. It renders it from a live preview
-// buffer and writes it next to the recording as `<name>.largeThumbnail`, then
-// hands that path to the library in the persistence result's
-// `filteredVideoPreviewPath`. Measured on the device (2026-09-24, 2.0.28): that
-// file was 1080x1920 of the **real scene** — the apple on the desk — while the
-// 17.7-second movie beside it was the clip, which is the whole of "the
-// recording's first frame is what the camera saw".
+// It is not taken from the movie. It is a separate JPEG beside it, named
+// `<movie>.largeThumbnail`, and the app hands its path to the library in the
+// persistence result's `filteredVideoPreviewPath`. Measured on the device
+// (2026-09-24), that file held 1080x1920 of the **real scene** — the apple on
+// the desk — while the 17.7-second movie beside it was the clip.
 //
-// So the clip is rendered into that file too: frame 0, the frame the movie
-// itself starts on, and upright — `appliesPreferredTrackTransform` applies the
-// track's own display matrix, which is the quarter turn the still path has to do
-// by hand. Done once per path, and only when there is a file to replace, because
-// the app writes its own thumbnail before the persistence result is built.
-static void vcam_write_video_thumbnail(NSString *path) {
-    if (path.length == 0 || !vcam_active()) return;
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:path]) return;   // the app has not written one yet
+// Who writes it, and when, is the whole of the bug. Hooked on the device:
+//
+//     M VIDRES   movie=…/Incoming/81193508581__A3218916-….MOV poster=absent
+//     M PERSIST  movie=…/Incoming/81193508581__A3218916-….MOV poster=absent
+//     M PREVPATH
+//     W NSData - writeToFile:atomically:
+//              …/Incoming/81193508581__A3218916-….largeThumbnail
+//              before=size=463789 mtime=…09:31:29
+//       VCAMLight.dylib+0x75c4 < CameraUI+0x12cbb8 < CameraUI+0x12a684
+//         < PhotoLibraryServicesCore+0x8d94
+//
+// The one write in that trace is ours — the `%orig` call inside
+// `filteredVideoPreviewPath`, where the tweak last wrote the file — and it came
+// after 463789 real-scene bytes had **already** landed: the file did not exist
+// when the persistence result was built and did exist by the time that getter
+// ran, a window of microseconds, and no hook on NSData, NSFileManager or ImageIO
+// in this process caught the writer. So the apple is written by someone else,
+// right at the hand-off, and the only reason the file ends up correct is that our
+// write comes a beat later — which is the flash the user sees.
+//
+// Three ways to be first, all cheap, all kept because the log says which one
+// fired:
+//
+//   seed     the clip's frame 0 — the frame the movie itself starts on, upright,
+//            since `appliesPreferredTrackTransform` applies the track's own
+//            display matrix — is written the moment the recording ends, long
+//            before anyone asks for the path. If the other writer skips a file
+//            that is already there, the apple never exists at all.
+//   rewrite  if that writer turns out to be in-process after all (the hooks
+//            above could have missed `writeToURL:`, a file handle, a move), the
+//            NSData write itself is where it can be caught: a write to one of
+//            our poster paths is handed our bytes instead of its own, so the
+//            apple still never reaches the disk.
+//   watch    whoever writes it, the file is polled — 50 ms apart for the first
+//            three seconds, then every 250 ms for six more — and put back when
+//            its size or mtime is no longer the one our write left. This is the
+//            one that catches a writer outside the process.
+//
+// The JPEG is encoded once per capture and cached: a rewrite has to be
+// instantaneous to be worth anything, and re-decoding a frame takes tens of ms.
+static NSLock *vcam_poster_lock(void) {
+    static NSLock *lock = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSLock new]; });
+    return lock;
+}
 
-    static NSMutableSet *done = nil;
-    if (done == nil) done = [NSMutableSet new];
-    if ([done containsObject:path]) return;
-    [done addObject:path];
+// Set while this thread is writing a poster file itself, so the NSData hook
+// below neither rewrites our own bytes nor calls itself back in.
+static __thread BOOL t_posterWrite = NO;
+
+// The poster paths this capture is responsible for, registered as soon as the
+// recording's URL is known — before the file exists, since the whole point is to
+// be there first.
+static NSMutableSet *g_posterPaths = nil;
+
+static void vcam_poster_remember(NSString *path) {
+    if (path.length == 0) return;
+    @synchronized (vcam_poster_lock()) {
+        if (g_posterPaths == nil) g_posterPaths = [NSMutableSet new];
+        [g_posterPaths addObject:path];
+    }
+}
+
+static BOOL vcam_poster_is_ours(NSString *path) {
+    if (path.length == 0) return NO;
+    @synchronized (vcam_poster_lock()) {
+        return g_posterPaths != nil && [g_posterPaths containsObject:path];
+    }
+}
+
+// Where our bytes go: the clip's first frame as a JPEG, or nil if the clip
+// cannot be read. One decode per capture, cached under the lock.
+static NSData *g_posterJpeg = nil;
+static NSString *g_posterJpegPath = nil;
+
+static NSData *vcam_poster_jpeg(NSString *forPath) {
+    @synchronized (vcam_poster_lock()) {
+        if (g_posterJpeg != nil && [g_posterJpegPath isEqualToString:forPath]) {
+            return g_posterJpeg;
+        }
+    }
 
     NSString *source = [VCAMFrameSource playbackPath];
-    if (source == nil) return;
+    if (source == nil) return nil;
 
     AVURLAsset *clip = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:source] options:nil];
     AVAssetImageGenerator *gen = [AVAssetImageGenerator assetImageGeneratorWithAsset:clip];
@@ -1752,36 +1820,176 @@ static void vcam_write_video_thumbnail(NSString *path) {
     gen.requestedTimeToleranceAfter = kCMTimeZero;
 
     CGImageRef image = [gen copyCGImageAtTime:kCMTimeZero actualTime:NULL error:nil];
-    if (image == NULL) {
-        vcam_live_note([NSString stringWithFormat:@"vthumb %@ no-frame",
-                        path.lastPathComponent]);
-        return;
-    }
+    if (image == NULL) return nil;
     // Scale 1 from a CGImage, so the JPEG is the picture's own size — a
     // CIImage-backed UIImage here would encode at the screen's 3x.
     UIImage *thumb = [UIImage imageWithCGImage:image];
     NSData *jpeg = UIImageJPEGRepresentation(thumb, 0.95);
     CGImageRelease(image);
+    if (jpeg == nil) return nil;
 
-    NSNumber *before = [[fm attributesOfItemAtPath:path error:nil] objectForKey:NSFileSize];
-    BOOL ok = (jpeg != nil) && [jpeg writeToFile:path atomically:YES];
-    NSNumber *after = [[fm attributesOfItemAtPath:path error:nil] objectForKey:NSFileSize];
-    vcam_live_note([NSString stringWithFormat:@"vthumb %@ ok=%d size=%d->%d",
-                    path.lastPathComponent, ok, before.intValue, after.intValue]);
+    @synchronized (vcam_poster_lock()) {
+        g_posterJpeg = jpeg;
+        g_posterJpegPath = forPath;
+    }
+    return jpeg;
 }
 
+// What each poster file looked like the last time it was ours. Any later write
+// by anyone else changes the size or the mtime, which is all the watch needs to
+// know it has been overruled.
+static NSMutableDictionary *g_posterState = nil;
+
+static NSArray *vcam_poster_stamp(NSString *path) {
+    NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    if (a == nil) return nil;
+    return @[a[NSFileSize] ?: @0, a[NSFileModificationDate] ?: [NSDate date]];
+}
+
+static BOOL vcam_poster_untouched(NSString *path) {
+    NSArray *was = nil;
+    @synchronized (vcam_poster_lock()) { was = g_posterState[path]; }
+    if (was == nil) return NO;
+    NSArray *now = vcam_poster_stamp(path);
+    return now != nil && [was isEqual:now];
+}
+
+// Remembers what the file looks like now, so the watch can tell a later write by
+// someone else from our own.
+static void vcam_poster_record(NSString *path) {
+    NSArray *now = vcam_poster_stamp(path);
+    @synchronized (vcam_poster_lock()) {
+        if (g_posterState == nil) g_posterState = [NSMutableDictionary new];
+        if (now != nil) g_posterState[path] = now;
+    }
+}
+
+// Writes the clip into `path` and remembers what that left behind.
+static BOOL vcam_poster_write(NSString *path) {
+    NSData *jpeg = vcam_poster_jpeg(path);
+    if (jpeg == nil) return NO;
+    vcam_poster_remember(path);
+
+    BOOL was = t_posterWrite;
+    t_posterWrite = YES;
+    BOOL ok = [jpeg writeToFile:path atomically:YES];
+    t_posterWrite = was;
+
+    vcam_poster_record(path);
+    return ok;
+}
+
+// Puts the clip at `path` and logs what it replaced. `why` names the caller,
+// because which one lands first is the whole question here; `create` allows the
+// file to be made rather than only replaced.
+static void vcam_poster_claim(NSString *path, NSString *why, BOOL create) {
+    if (path.length == 0 || !vcam_active()) return;
+    NSArray *before = vcam_poster_stamp(path);
+    if (before == nil && !create) return;         // nothing there to replace yet
+
+    BOOL ok = vcam_poster_write(path);
+    NSArray *after = vcam_poster_stamp(path);
+    vcam_live_note([NSString stringWithFormat:@"vthumb %@ %@ ok=%d size=%@->%@",
+                    why, path.lastPathComponent, ok,
+                    before.count ? before[0] : @"absent",
+                    after.count ? after[0] : @"absent"]);
+}
+
+// The watch, and the seed. Called the moment the recording's URL can be named,
+// which is the earliest the poster's name is known.
+static void vcam_poster_watch(NSURL *movieURL) {
+    if (movieURL.path.length == 0 || !vcam_active()) return;
+    NSString *path = [[movieURL.path stringByDeletingPathExtension]
+                      stringByAppendingPathExtension:@"largeThumbnail"];
+    vcam_poster_remember(path);
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        @autoreleasepool {
+            vcam_poster_claim(path, @"seed", YES);
+        }
+        for (int i = 0; i < 60; i++) {          // ~3 s at 50 ms
+            @autoreleasepool {
+                if (!vcam_poster_untouched(path)) vcam_poster_claim(path, @"watch", NO);
+            }
+            usleep(50 * 1000);
+        }
+        for (int i = 0; i < 24; i++) {          // then ~6 s at 250 ms
+            @autoreleasepool {
+                if (!vcam_poster_untouched(path)) vcam_poster_claim(path, @"watch-late", NO);
+            }
+            usleep(250 * 1000);
+        }
+    });
+}
+
+// The rewrite. Everything the process writes through NSData passes here, so the
+// filter is deliberately narrow: one of our poster paths, this thread is not the
+// one writing it, and a replacement is active. A path that is not ours is a
+// straight `%orig` and costs a failed set lookup.
+static NSData *vcam_poster_rewrite(NSString *path, NSString *how) {
+    if (t_posterWrite || !vcam_poster_is_ours(path) || !vcam_active()) return nil;
+    NSData *jpeg = vcam_poster_jpeg(path);
+    if (jpeg == nil) return nil;
+
+    NSArray *before = vcam_poster_stamp(path);
+    vcam_live_note([NSString stringWithFormat:@"vthumb rewrite %@ %@ size=%@->%lu",
+                    how, path.lastPathComponent,
+                    before.count ? before[0] : @"absent", (unsigned long)jpeg.length]);
+    return jpeg;
+}
+
+%hook NSData
+
+- (BOOL)writeToFile:(NSString *)path atomically:(BOOL)useAuxiliaryFile {
+    NSData *ours = vcam_poster_rewrite(path, @"atomically");
+    if (ours == nil) return %orig;
+
+    BOOL was = t_posterWrite;
+    t_posterWrite = YES;
+    BOOL ok = [ours writeToFile:path atomically:useAuxiliaryFile];
+    t_posterWrite = was;
+    vcam_poster_record(path);         // keep the state record in step
+    return ok;
+}
+
+- (BOOL)writeToFile:(NSString *)path options:(NSDataWritingOptions)writeOptionsMask
+              error:(NSError **)errorPtr {
+    NSData *ours = vcam_poster_rewrite(path, @"options");
+    if (ours == nil) return %orig;
+
+    BOOL was = t_posterWrite;
+    t_posterWrite = YES;
+    BOOL ok = [ours writeToFile:path options:writeOptionsMask error:errorPtr];
+    t_posterWrite = was;
+    vcam_poster_record(path);
+    return ok;
+}
+
+- (BOOL)writeToURL:(NSURL *)url options:(NSDataWritingOptions)writeOptionsMask
+             error:(NSError **)errorPtr {
+    NSData *ours = vcam_poster_rewrite(url.path, @"url");
+    if (ours == nil) return %orig;
+
+    BOOL was = t_posterWrite;
+    t_posterWrite = YES;
+    BOOL ok = [ours writeToURL:url options:writeOptionsMask error:errorPtr];
+    t_posterWrite = was;
+    vcam_poster_record(url.path);
+    return ok;
+}
+
+%end
+
 // The app asks a persistence result for the thumbnail path when it hands the
-// capture to the library, which is the moment the clip can go into that file:
-// measured, the file is already on disk by then and this is the only time in the
-// whole capture that anything asks.
-//
-// A getter with no arguments and one object return, so the signature needs no
-// guessing — `@16@0:8` off the device.
+// capture to the library — the last moment in the process before the library
+// reads it, and a getter with no arguments and one object return, so the
+// signature needs no guessing (`@16@0:8` off the device).
 %hook CAMVideoLocalPersistenceResult
 
 - (NSString *)filteredVideoPreviewPath {
     NSString *path = %orig;
-    vcam_write_video_thumbnail(path);
+    vcam_poster_remember(path);
+    if (!vcam_poster_untouched(path)) vcam_poster_claim(path, @"persist", NO);
     return path;
 }
 
@@ -1834,6 +2042,12 @@ static void vcam_write_video_thumbnail(NSString *path) {
                 // recording ends — that is when the app hands the file to the
                 // library — and the answer has to stay the app's own URL for the
                 // rest of the session, or the scratch path leaks back out.
+
+                // The poster file is named after the app's URL and is written by
+                // the media daemon, which nothing here can hook, so the watch
+                // starts now rather than at the persistence hand-off: this is the
+                // earliest moment the name is known.
+                vcam_poster_watch(appURL);
 
                 vcam_replace_recording(appURL, url, ^(BOOL replaced) {
                     [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
