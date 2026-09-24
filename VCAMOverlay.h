@@ -57,6 +57,10 @@
 // whole library is what a capture is matched against, so the list has to keep
 // every still handed over, however long ago — a plain count is nothing next to
 // the frames a looping clip can revisit.
+//
+// A line is the size of the still in bytes, which is also the size the library
+// files it under, so the list can be seeded by walking DCIM and no still has to
+// be read back.
 #define VCAM_STILL_SEEN_NAME @"Library/Application Support/VCAMLight/stills.seen"
 #define VCAM_STILL_SEEN_PATH @"/var/tmp/vcamlight/last_stills"
 #define VCAM_STILL_SEEN_KEEP 512

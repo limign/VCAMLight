@@ -407,17 +407,16 @@ static NSData *vcam_jpeg_from_frame(CMSampleBufferRef frame,
     return UIImageJPEGRepresentation(img, 1.0);
 }
 
-// A fingerprint of one still, for the "already filed" list. Not a hash for
-// security: it only has to tell two of our own JPEGs apart, and a still is close
-// to a megabyte, so FNV-1a over the bytes is enough and needs no import.
+// What is remembered of a still handed to the library is its size. Photos files
+// a capture as a *duplicate* only when the library holds the very same picture,
+// and the same picture is the same bytes and so the same size — a size cannot
+// miss one. The cost of being wrong the other way, two different frames of the
+// clip that happen to come out the same length, is a step to another frame.
+//
+// Measured on the device: the library's copy of our still is the bytes we handed
+// over, unchanged, so the size it holds is the size we rendered.
 static NSString *vcam_still_stamp(NSData *jpeg) {
-    uint64_t hash = 1469598103934665603ULL;
-    const uint8_t *bytes = (const uint8_t *)jpeg.bytes;
-    for (NSUInteger i = 0; i < jpeg.length; i++) {
-        hash ^= bytes[i];
-        hash *= 1099511628211ULL;
-    }
-    return [NSString stringWithFormat:@"%016llx-%lu", hash, (unsigned long)jpeg.length];
+    return [NSString stringWithFormat:@"%lu", (unsigned long)jpeg.length];
 }
 
 // The app's own container survives a reboot, which /var/tmp does not; a still
