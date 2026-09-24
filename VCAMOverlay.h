@@ -43,6 +43,17 @@
 #define VCAM_PLAYBACK_PATH  @"/var/tmp/vcamlight/selected.mov"
 #define VCAM_PLAYBACK_STAMP @"/var/tmp/vcamlight/stamp"
 
+// ── The same clip as a Live Photo movie ──────────────────────────────────────
+// A Live Photo's movie is HEVC on this system, and a substituted movie in
+// another codec is left behind in Incoming instead of being paired — measured:
+// every Live Photo captured since the substitution shipped, while the very same
+// clips import fine as ordinary recordings. The master is h264, so the Live Photo
+// gets a re-encoded copy of its own, made once per master revision on a
+// background queue; until it exists the capture falls back to the h264 clip,
+// which replaces the real scene but will not pair.
+#define VCAM_LIVE_PATH      @"/var/tmp/vcamlight/selected.live.mov"
+#define VCAM_LIVE_STAMP     @"/var/tmp/vcamlight/live-stamp"
+
 // ── Stills already handed to the library ──────────────────────────────────────
 // Photos files a capture whose still it has already seen as a *duplicate* of that
 // asset, and a duplicate of a Live Photo comes with the other asset's movie. The

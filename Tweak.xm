@@ -110,6 +110,8 @@ static BOOL vcam_active(void) {
 + (UIWindow *)keyWindow;
 // Path AVAssetReader is allowed to open, or nil when the master is unreadable.
 + (NSString *)playbackPath;
+// The same clip as an HEVC movie, or nil until that copy has been made.
++ (NSString *)liveMoviePath;
 @end
 
 // Reader state, kept between frames. One reader at a time: a reader is single
@@ -132,6 +134,16 @@ static NSTimeInterval g_nextFrameDue = 0;    // media clock time the next previe
 static CMSampleBufferRef g_cachedFrame = NULL;
 static NSTimeInterval g_lastPreviewFrame = 0;
 
+// Which revision of the master clip the staged copies were made from: its size
+// and modification date together. nil when there is no master.
+static NSString *vcam_master_stamp(void) {
+    NSDictionary *master = [[NSFileManager defaultManager]
+                            attributesOfItemAtPath:VCAM_VIDEO_PATH error:nil];
+    if (master == nil) return nil;
+    return [NSString stringWithFormat:@"%@ %@", master[NSFileSize],
+            master[NSFileModificationDate]];
+}
+
 @implementation VCAMFrameSource
 
 // The media daemon behind AVAssetReader only opens paths this app's sandbox
@@ -141,11 +153,9 @@ static NSTimeInterval g_lastPreviewFrame = 0;
 // which master revision the copy came from.
 + (NSString *)playbackPath {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSDictionary *master = [fm attributesOfItemAtPath:VCAM_VIDEO_PATH error:nil];
-    if (master == nil) return nil;
+    NSString *stamp = vcam_master_stamp();
+    if (stamp == nil) return nil;
 
-    NSString *stamp = [NSString stringWithFormat:@"%@ %@",
-                       master[NSFileSize], master[NSFileModificationDate]];
     NSString *staged = [NSString stringWithContentsOfFile:VCAM_PLAYBACK_STAMP
                                                  encoding:NSUTF8StringEncoding error:nil];
     if ([stamp isEqualToString:staged] && [fm fileExistsAtPath:VCAM_PLAYBACK_PATH]) {
@@ -165,7 +175,75 @@ static NSTimeInterval g_lastPreviewFrame = 0;
     [stamp writeToFile:VCAM_PLAYBACK_STAMP
             atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
+    // Start the HEVC copy now, while the user is still lining up a shot, instead
+    // of at the first Live Photo, where it would arrive too late to be used. The
+    // nested playbackPath call returns on the stamp just written.
+    [self liveMoviePath];
+
     return VCAM_PLAYBACK_PATH;
+}
+
+// The staged clip re-encoded to HEVC, which is what a Live Photo's movie has to
+// be. nil until it is ready — the caller falls back to the h264 copy rather than
+// leave the real movie in place. The encode runs once per master revision, on a
+// utility queue, and only a finished one is put at the path the callers read, so
+// the preview never sees a half-written file. hvc1 rather than hev1, because that
+// is what the camera's own Live Photo movies are tagged with.
++ (NSString *)liveMoviePath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *stamp = vcam_master_stamp();
+    if (stamp == nil) return nil;
+
+    NSString *made = [NSString stringWithContentsOfFile:VCAM_LIVE_STAMP
+                                               encoding:NSUTF8StringEncoding error:nil];
+    if ([stamp isEqualToString:made] && [fm fileExistsAtPath:VCAM_LIVE_PATH]) {
+        return VCAM_LIVE_PATH;
+    }
+
+    // One encode at a time. A second caller while it runs is told "not yet"
+    // rather than starting the same work twice.
+    static NSString *encoding = nil;
+    if ([encoding isEqualToString:stamp]) return nil;
+
+    NSString *source = [self playbackPath];
+    if (source == nil) return nil;
+
+    [fm createDirectoryAtPath:VCAM_PLAYBACK_DIR
+  withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *temp = [VCAM_PLAYBACK_DIR stringByAppendingPathComponent:@"selected.live.tmp.mov"];
+    [fm removeItemAtPath:temp error:nil];
+
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:source]
+                                            options:nil];
+    AVAssetExportSession *encode =
+        [AVAssetExportSession exportSessionWithAsset:asset
+                                          presetName:AVAssetExportPresetHEVCHighestQuality];
+    if (encode == nil) return nil;
+
+    encoding = [stamp copy];
+    encode.outputURL = [NSURL fileURLWithPath:temp];
+    encode.outputFileType = AVFileTypeQuickTimeMovie;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        [encode exportAsynchronouslyWithCompletionHandler:^{
+            BOOL done = (encode.status == AVAssetExportSessionStatusCompleted);
+            NSFileManager *files = [NSFileManager defaultManager];
+            if (done) {
+                [files removeItemAtPath:VCAM_LIVE_PATH error:nil];
+                done = [files moveItemAtPath:temp toPath:VCAM_LIVE_PATH error:nil];
+                if (done) {
+                    [stamp writeToFile:VCAM_LIVE_STAMP
+                            atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                }
+            }
+            [files removeItemAtPath:temp error:nil];
+            vcam_live_note([NSString stringWithFormat:@"%@ live-encode ok=%d status=%ld",
+                            [NSDate date], done, (long)encode.status]);
+            encoding = nil;
+        }];
+    });
+
+    return nil;
 }
 
 // Opens a reader over the already-parsed asset, in the format the caller needs.
@@ -1238,7 +1316,14 @@ static void vcam_live_note(NSString *line) {
 }
 
 static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
-    NSString *source = [VCAMFrameSource playbackPath];
+    // The HEVC copy when there is one: this movie has to be a movie Photos will
+    // pair with a still, and h264 is what has been going unpaired. Until the
+    // encode finishes, the h264 clip still replaces the real scene — a movie that
+    // will not pair is better than one that shows what was actually in front of
+    // the camera.
+    NSString *source = [VCAMFrameSource liveMoviePath];
+    BOOL liveSource = (source != nil);
+    if (source == nil) source = [VCAMFrameSource playbackPath];
     NSDate *began = [NSDate date];
     if (url == nil || source == nil) {
         vcam_live_note([NSString stringWithFormat:@"%@ no-source url=%@ source=%@",
@@ -1332,10 +1417,11 @@ static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
         NSNumber *sizeAfter = [[fm attributesOfItemAtPath:url.path error:nil]
                                objectForKey:NSFileSize];
         vcam_live_note([NSString stringWithFormat:
-                        @"%@ %@ movie=%.3fs clip=%.3fs meta=%lu took=%dms ok=%d size=%d->%d status=%ld",
+                        @"%@ %@ movie=%.3fs clip=%.3fs meta=%lu hevc=%d took=%dms ok=%d size=%d->%d status=%ld",
                         began, url.lastPathComponent,
                         CMTimeGetSeconds(movieLength), CMTimeGetSeconds(clipLength),
-                        (unsigned long)metaTracks, (int)(-[began timeIntervalSinceNow] * 1000),
+                        (unsigned long)metaTracks, (int)liveSource,
+                        (int)(-[began timeIntervalSinceNow] * 1000),
                         ok, sizeBefore.intValue, sizeAfter.intValue, (long)writer.status]);
         [fm removeItemAtURL:temp error:nil];
         dispatch_async(dispatch_get_main_queue(), ^{ done(ok); });
