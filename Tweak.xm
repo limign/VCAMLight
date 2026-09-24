@@ -614,12 +614,32 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
 // Measured on the test device: the Camera app holds one AVCaptureMetadataOutput
 // configured for {org.iso.QRCode, com.apple.AppClipCode, face}, and it is how
 // the app recognises a QR code held up to the lens. The detection itself uses
-// the real frames, so a replacement video on screen changes nothing about it —
-// which is why a QR code still gets recognised over the top of the overlay.
+// the real frames, which the substitution never touches — the preview is a layer
+// drawn over the live one — so a QR code is still detected over the top of the
+// clip. The delegate callback is the only place the app is told about it, so
+// while a replacement is active the result array is emptied. An empty array
+// rather than no call at all: clients that never hear back keep showing the last
+// result.
 //
-// The delegate callback is the only place the app is told, so while a
-// replacement is active the callback is swallowed. An empty array rather than
-// no call at all: clients that never hear back keep showing the last result.
+// Two selectors, not one. The header documents
+// `captureOutput:didOutputMetadataObjects:fromConnection:`, but the Camera app
+// does not implement it at all — it answers the private four-argument variant
+// with the tracked types appended, and AVFoundation dispatches to whichever
+// shape the delegate responds to:
+//
+//   CAMCaptureEngine - captureOutput:didOutputMetadataObjects:forMetadataObjectTypes:fromConnection:
+//        v48@0:8@16@24@32@40          ← what the app implements
+//   CAMCaptureEngine - captureOutput:didOutputMetadataObjects:fromConnection:
+//        absent                       ← what this hook used to install itself on
+//
+// Hooking only the public name therefore added an override on a selector no
+// caller ever sends: a silent no-op, and the app kept getting the real QR
+// results and raising its banner anyway. Both shapes are hooked now, so a client
+// using either one is covered. Measured on 15.7.1.
+static NSArray *vcam_metadata_objects(NSArray *objects) {
+    return vcam_active() ? @[] : objects;
+}
+
 %hook AVCaptureMetadataOutput
 
 - (void)setMetadataObjectsDelegate:(id<AVCaptureMetadataOutputObjectsDelegate>)objectsDelegate
@@ -629,28 +649,56 @@ static void vcam_enqueue_frame(AVSampleBufferDisplayLayer *layer, CMSampleBuffer
         return;
     }
 
-    // Lazy, once per delegate class, same as the video data output above.
-    static NSMutableArray *hookedClasses = nil;
-    if (hookedClasses == nil) hookedClasses = [NSMutableArray new];
-    NSString *cls = NSStringFromClass([objectsDelegate class]);
+    // Lazy, once per class and selector, same as the video data output above.
+    static NSMutableSet *hooked = nil;
+    if (hooked == nil) hooked = [NSMutableSet new];
 
-    if (![hookedClasses containsObject:cls]) {
-        [hookedClasses addObject:cls];
-        __block void (*original)(id, SEL, AVCaptureOutput *,
-                                 NSArray *, AVCaptureConnection *) = NULL;
-        MSHookMessageEx(
-            [objectsDelegate class],
-            @selector(captureOutput:didOutputMetadataObjects:fromConnection:),
-            imp_implementationWithBlock(^(id dself, AVCaptureOutput *output,
-                                          NSArray *objects,
-                                          AVCaptureConnection *connection) {
-                if (original) {
-                    original(dself, @selector(captureOutput:didOutputMetadataObjects:fromConnection:),
-                             output, vcam_active() ? @[] : objects, connection);
-                }
-            }),
-            (IMP *)&original);
+    Class cls = [objectsDelegate class];
+    NSString *name = NSStringFromClass(cls);
+    // Which shapes this delegate answers is a property of the class, so a class
+    // that implements neither is left alone rather than given a hook that can
+    // never run.
+    SEL pair[2] = {
+        @selector(captureOutput:didOutputMetadataObjects:fromConnection:),
+        NSSelectorFromString(@"captureOutput:didOutputMetadataObjects:forMetadataObjectTypes:fromConnection:"),
+    };
+
+    for (int i = 0; i < 2; i++) {
+        SEL sel = pair[i];
+        NSString *key = [NSString stringWithFormat:@"%@|%d", name, i];
+        if ([hooked containsObject:key]) continue;
+        if (![cls instancesRespondToSelector:sel]) continue;
+        [hooked addObject:key];
+
+        if (i == 0) {
+            __block void (*original)(id, SEL, AVCaptureOutput *, NSArray *,
+                                     AVCaptureConnection *) = NULL;
+            MSHookMessageEx(cls, sel,
+                imp_implementationWithBlock(^(id dself, AVCaptureOutput *output,
+                                              NSArray *objects,
+                                              AVCaptureConnection *connection) {
+                    if (original) {
+                        original(dself, sel, output, vcam_metadata_objects(objects), connection);
+                    }
+                }), (IMP *)&original);
+        } else {
+            // The tracked-types set is passed through untouched: what the
+            // delegate sees is then exactly what a frame with nothing in it
+            // looks like, rather than a shape no real callback ever has.
+            __block void (*original)(id, SEL, AVCaptureOutput *, NSArray *, NSSet *,
+                                     AVCaptureConnection *) = NULL;
+            MSHookMessageEx(cls, sel,
+                imp_implementationWithBlock(^(id dself, AVCaptureOutput *output,
+                                              NSArray *objects, NSSet *types,
+                                              AVCaptureConnection *connection) {
+                    if (original) {
+                        original(dself, sel, output, vcam_metadata_objects(objects),
+                                 types, connection);
+                    }
+                }), (IMP *)&original);
+        }
     }
+
     %orig;
 }
 
