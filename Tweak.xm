@@ -13,7 +13,7 @@
 //   AVCaptureVideoDataOutput    frames handed to the app (QR scan, analysis…)
 //   AVCaptureMetadataOutput     barcodes and faces the app recognises
 //   AVCaptureStillImageOutput   legacy still capture
-//   AVCapturePhotoOutput        modern photo capture
+//   AVCapturePhotoOutput        modern photo capture, stills and Live Photos
 //   AVCaptureMovieFileOutput    video, which the daemon writes for us
 //
 // The tweak is injected into every UIKit process; the volume-button hook at the
@@ -923,6 +923,37 @@ static void vcam_install_photo_overrides(id photo) {
                     }
                 }),
                 (IMP *)&origFinish);
+
+            // Live Photo movie. Same delegate, one callback later: the daemon has
+            // just finished writing the real movie into the URL the app named, and
+            // the app has not been told yet. Swapping the file here means the app
+            // — and the library it hands the pair to — only ever sees the clip.
+            // The callback is optional, so the class is asked before hooking it.
+            SEL liveSel = @selector(captureOutput:didFinishProcessingLivePhotoToMovieFileAtURL:
+                                    duration:photoDisplayTime:resolvedSettings:error:);
+            if (class_getInstanceMethod([delegate class], liveSel) != NULL) {
+                __block void (*origLive)(id, SEL, AVCapturePhotoOutput *, NSURL *,
+                                         CMTime, CMTime, id, NSError *) = NULL;
+                MSHookMessageEx([delegate class], liveSel,
+                    imp_implementationWithBlock(^(id dself, AVCapturePhotoOutput *output,
+                                                  NSURL *url, CMTime duration,
+                                                  CMTime displayTime, id resolved,
+                                                  NSError *error) {
+                        if (url == nil || error != nil || !vcam_active()) {
+                            if (origLive) {
+                                origLive(dself, liveSel, output, url, duration,
+                                         displayTime, resolved, error);
+                            }
+                            return;
+                        }
+                        vcam_replace_live_movie(url, ^(BOOL replaced) {
+                            if (origLive) {
+                                origLive(dself, liveSel, output, url, duration,
+                                         displayTime, resolved, error);
+                            }
+                        });
+                    }), (IMP *)&origLive);
+            }
         }
     }
     %orig;
@@ -942,30 +973,17 @@ static void vcam_install_photo_overrides(id photo) {
 static NSMutableDictionary *g_recordingURLs = nil;
 static NSUInteger g_recordingSeq = 0;
 
-// Puts the chosen clip at the app's own output URL, trimmed to the length that
-// was actually recorded, then reports on the main queue — where
-// AVCaptureFileOutput delivers its delegate calls and where the app reads the
-// file back.
-static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(BOOL replaced)) {
+// Puts the chosen clip at `appURL`, cut to at most `length`, then reports on the
+// main queue — where AVCaptureFileOutput delivers its delegate calls and where
+// the app reads the file back.
+static void vcam_export_clip(NSURL *appURL, CMTime length, void (^done)(BOOL replaced)) {
     NSString *source = [VCAMFrameSource playbackPath];
     if (source == nil) { done(NO); return; }
 
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm removeItemAtURL:appURL error:nil];
 
-    AVURLAsset *recordedAsset = [AVURLAsset URLAssetWithURL:recorded options:nil];
     AVURLAsset *sourceAsset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:source] options:nil];
-    CMTime sourceLength = sourceAsset.duration;
-    CMTime recordedLength = recordedAsset.duration;
-
-    // The clip should not outlast the recording. An unreadable or zero length
-    // falls back to the whole clip rather than to a still.
-    CMTime length = sourceLength;
-    if (CMTIME_IS_NUMERIC(recordedLength) && CMTIME_IS_NUMERIC(sourceLength) &&
-        CMTimeCompare(recordedLength, kCMTimeZero) > 0 &&
-        CMTimeCompare(recordedLength, sourceLength) < 0) {
-        length = recordedLength;
-    }
 
     // Not named `export`: Theos compiles this file as Objective-C++, where that
     // is a keyword.
@@ -984,7 +1002,9 @@ static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(
     writer.outputURL = appURL;
     writer.outputFileType = [appURL.pathExtension.lowercaseString isEqualToString:@"mp4"]
                                 ? AVFileTypeMPEG4 : AVFileTypeQuickTimeMovie;
-    writer.timeRange = CMTimeRangeMake(kCMTimeZero, length);
+    if (CMTIME_IS_NUMERIC(length) && CMTimeCompare(length, kCMTimeZero) > 0) {
+        writer.timeRange = CMTimeRangeMake(kCMTimeZero, length);
+    }
 
     [writer exportAsynchronouslyWithCompletionHandler:^{
         BOOL ok = (writer.status == AVAssetExportSessionStatusCompleted);
@@ -996,6 +1016,44 @@ static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(
         }
         dispatch_async(dispatch_get_main_queue(), ^{ done(ok); });
     }];
+}
+
+// The recording: the clip stands in for what was recorded, cut to the length
+// that was actually recorded.
+static void vcam_replace_recording(NSURL *appURL, NSURL *recorded, void (^done)(BOOL replaced)) {
+    NSString *source = [VCAMFrameSource playbackPath];
+    if (source == nil) { done(NO); return; }
+
+    AVURLAsset *recordedAsset = [AVURLAsset URLAssetWithURL:recorded options:nil];
+    AVURLAsset *sourceAsset = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:source] options:nil];
+    CMTime sourceLength = sourceAsset.duration;
+    CMTime recordedLength = recordedAsset.duration;
+
+    // The clip should not outlast the recording. An unreadable or zero length
+    // falls back to the whole clip rather than to a still.
+    CMTime length = sourceLength;
+    if (CMTIME_IS_NUMERIC(recordedLength) && CMTIME_IS_NUMERIC(sourceLength) &&
+        CMTimeCompare(recordedLength, kCMTimeZero) > 0 &&
+        CMTimeCompare(recordedLength, sourceLength) < 0) {
+        length = recordedLength;
+    }
+
+    vcam_export_clip(appURL, length, done);
+}
+
+// The movie beside a Live Photo. It is written by the camera daemon, not by this
+// process — the frames of a Live Photo movie never pass through an app — so it
+// gets the same treatment as a recording: whatever landed where the app expects
+// its movie is replaced by the clip, cut to the movie's own length so the Live
+// Photo keeps its shape.
+static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
+    if (url == nil || [VCAMFrameSource playbackPath] == nil) { done(NO); return; }
+
+    CMTime length = kCMTimeInvalid;
+    AVURLAsset *movie = [AVURLAsset URLAssetWithURL:url options:nil];
+    if (movie != nil) length = movie.duration;
+
+    vcam_export_clip(url, length, done);
 }
 
 %hook AVCaptureMovieFileOutput
