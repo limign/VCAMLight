@@ -231,11 +231,25 @@ static NSString *vcam_stage_clip(void) {
     AVAssetExportSession *encode =
         [AVAssetExportSession exportSessionWithAsset:asset
                                           presetName:AVAssetExportPresetHEVCHighestQuality];
-    if (encode == nil) return nil;
+    if (encode == nil) {
+        // nil is the preset being refused for this asset, which is a different
+        // failure from one that runs and comes back an error: without this line
+        // the two look the same, a fallback to h264 and no note of why.
+        vcam_live_note([NSString stringWithFormat:@"%@ live-encode no-preset source=%@",
+                        [NSDate date], source.lastPathComponent]);
+        return nil;
+    }
 
     encoding = [stamp copy];
     encode.outputURL = [NSURL fileURLWithPath:temp];
     encode.outputFileType = AVFileTypeQuickTimeMovie;
+    vcam_live_note([NSString stringWithFormat:@"%@ live-encode began at=%dx%d fps=%.2f",
+                    [NSDate date], (int)[[asset tracksWithMediaType:AVMediaTypeVideo].firstObject
+                                        naturalSize].width,
+                    (int)[[asset tracksWithMediaType:AVMediaTypeVideo].firstObject
+                          naturalSize].height,
+                    [[asset tracksWithMediaType:AVMediaTypeVideo].firstObject
+                     nominalFrameRate]]);
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         [encode exportAsynchronouslyWithCompletionHandler:^{
@@ -249,9 +263,13 @@ static NSString *vcam_stage_clip(void) {
                             atomically:YES encoding:NSUTF8StringEncoding error:nil];
                 }
             }
+            NSNumber *bytes = [[files attributesOfItemAtPath:VCAM_LIVE_PATH error:nil]
+                               objectForKey:NSFileSize];
             [files removeItemAtPath:temp error:nil];
-            vcam_live_note([NSString stringWithFormat:@"%@ live-encode ok=%d status=%ld",
-                            [NSDate date], done, (long)encode.status]);
+            vcam_live_note([NSString stringWithFormat:
+                            @"%@ live-encode ok=%d status=%ld size=%d err=%@",
+                            [NSDate date], done, (long)encode.status, bytes.intValue,
+                            encode.error.localizedDescription]);
             encoding = nil;
         }];
     });
