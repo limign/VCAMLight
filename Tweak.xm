@@ -37,7 +37,7 @@
 
 static BOOL vcam_active(void);
 // Defined with the still helpers, called from the still paths below them.
-static NSData *vcam_still_jpeg(CMSampleBufferRef *frameOut);
+static NSData *vcam_still_jpeg(CMSampleBufferRef *frameOut, CGSize target);
 // Defined with the recording path, called from the photo delegate above it.
 static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced));
 // One line per Live Photo movie handled, appended where the clip is staged.
@@ -543,11 +543,47 @@ static NSString *vcam_stage_clip(void) {
 
 @end
 
-// Renders one decoded frame to JPEG at the frame's own size, honouring the
-// orientation the capture connection reported.
+// The shape a capture is meant to be stored in, upright, or CGSizeZero when
+// nothing named one. The pipeline's own answer, off the resolved settings of the
+// photo being finished — after every format it picked and every crop it applied
+// — rather than a guess from the clip or from the settings the app handed in.
+//
+// Why it is needed at all: the clip is 720x1280 whatever the camera is set to,
+// so a still rendered from the frame alone came out 9:16 in every mode. Measured
+// on the test device against the camera's own capture in the same session
+// (IMG_0385, clip off): the mode there was 4:3 and the stored photo 3024x4032,
+// while ours beside it was 720x1280.
+static CGSize vcam_still_target(id photo) {
+    if (photo == nil) return CGSizeZero;
+    @try {
+        if (![photo respondsToSelector:@selector(resolvedSettings)]) return CGSizeZero;
+        id resolved = [photo resolvedSettings];
+        if (resolved == nil ||
+            ![resolved respondsToSelector:@selector(photoDimensions)]) return CGSizeZero;
+
+        CMVideoDimensions dims = [resolved photoDimensions];
+        if (dims.width <= 0 || dims.height <= 0) return CGSizeZero;
+
+        // Turned upright here, not by the client: the pipeline names the shape in
+        // the sensor's own orientation (4032x3024 for this portrait, 4:3 capture)
+        // and the quarter turn to the stored file is applied by the app. The
+        // frame this is drawn from is already upright, so the two have to agree.
+        BOOL portrait = (g_photoOrientation == AVCaptureVideoOrientationPortrait ||
+                         g_photoOrientation == AVCaptureVideoOrientationPortraitUpsideDown);
+        return portrait ? CGSizeMake(dims.height, dims.width)
+                        : CGSizeMake(dims.width, dims.height);
+    } @catch (NSException *e) {
+        return CGSizeZero;
+    }
+}
+
+// Renders one decoded frame to JPEG, honouring the orientation the capture
+// connection reported. `target` is the shape to store it in, or CGSizeZero to
+// keep the frame's own.
 static NSData *vcam_jpeg_from_frame(CMSampleBufferRef frame,
                                     AVCaptureVideoOrientation videoOrientation,
-                                    CGFloat quality) {
+                                    CGFloat quality,
+                                    CGSize target) {
     if (frame == NULL) return nil;
     CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(frame);
     if (pixels == NULL) return nil;
@@ -576,8 +612,21 @@ static NSData *vcam_jpeg_from_frame(CMSampleBufferRef frame,
     // nobody here controls.
     UIImage *raw = [UIImage imageWithCGImage:cg scale:1.0 orientation:orient];
     CGSize size = raw.size;   // already the oriented size: width and height swap
-    UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
-    [raw drawInRect:CGRectMake(0, 0, size.width, size.height)];
+
+    // Filled rather than fitted: the frame is scaled just until it covers the
+    // target and the overhang is cropped off evenly, so the picture comes out in
+    // the mode's shape with no bars and nothing stretched. When the two shapes
+    // differ the clip is the only source either way, so a target bigger than it
+    // — 4:3 is 4.2x the clip's width — is an upscale carrying no more detail than
+    // the clip has. The callers that name no target draw at 1:1, as before.
+    CGSize out = size;
+    if (target.width >= 1.0 && target.height >= 1.0) out = target;
+    CGFloat scale = MAX(out.width / size.width, out.height / size.height);
+    CGSize drawn = CGSizeMake(size.width * scale, size.height * scale);
+    UIGraphicsBeginImageContextWithOptions(out, YES, 1.0);
+    [raw drawInRect:CGRectMake((out.width - drawn.width) / 2.0,
+                               (out.height - drawn.height) / 2.0,
+                               drawn.width, drawn.height)];
     UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     CGImageRelease(cg);
@@ -680,8 +729,9 @@ static void vcam_still_remember(NSString *stamp) {
 }
 
 // Renders a still the library has not filed yet, and hands back the frame it
-// came from. forceRenew: the still path runs off the capture queue, not the
-// display link, so it must not be told "not due yet" and hand back nothing.
+// came from, at the shape `target` names. forceRenew: the still path runs off
+// the capture queue, not the display link, so it must not be told "not due yet"
+// and hand back nothing.
 //
 // Why the retry: the library matches a capture against the stills it already
 // holds and files a repeat as a *duplicate*, and a duplicate of a Live Photo
@@ -695,7 +745,7 @@ static void vcam_still_remember(NSString *stamp) {
 // bursts, and a burst leaves the library holding a run of consecutive frames.
 // Each retry skips well past a run instead, rendering only the frame it lands
 // on — the skips are just reads.
-static NSData *vcam_still_jpeg(CMSampleBufferRef *frameOut) {
+static NSData *vcam_still_jpeg(CMSampleBufferRef *frameOut, CGSize target) {
     unsigned long serial = vcam_still_serial();
     NSString *marker = [NSString stringWithFormat:@"VCAMLight %lu-%lu",
                         (unsigned long)[NSDate date].timeIntervalSince1970, serial];
@@ -713,7 +763,7 @@ static NSData *vcam_still_jpeg(CMSampleBufferRef *frameOut) {
         }
         frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:YES];
         if (frame == NULL) return nil;
-        jpeg = vcam_jpeg_from_frame(frame, g_photoOrientation, quality);
+        jpeg = vcam_jpeg_from_frame(frame, g_photoOrientation, quality, target);
         if (jpeg == nil) return nil;
         jpeg = vcam_marked_jpeg(jpeg, marker);
 
@@ -1140,7 +1190,9 @@ static NSArray *vcam_metadata_objects(NSArray *objects) {
 }
 
 + (NSData *)jpegStillImageNSDataRepresentation:(CMSampleBufferRef)jpegSampleBuffer {
-    NSData *replaced = vcam_still_jpeg(NULL);
+    // Nothing named a shape on this path, which is only reached by clients that
+    // take their stills through the pre-AVCapturePhotoOutput API.
+    NSData *replaced = vcam_still_jpeg(NULL, CGSizeZero);
     return replaced ?: %orig;
 }
 
@@ -1230,8 +1282,12 @@ static void vcam_install_photo_overrides(id photo) {
     // One frame serves both the file and the thumbnail. Held rather than used
     // and dropped: the engine releases its cached frame on the next call, and
     // the client may still be rendering from this one.
+    // Asked of the photo before anything is rendered from it: the shape the
+    // pipeline resolved for this capture, which is what the still is stored in.
+    CGSize target = vcam_still_target(photo);
+
     CMSampleBufferRef frame = NULL;
-    NSData *jpeg = vcam_still_jpeg(&frame);
+    NSData *jpeg = vcam_still_jpeg(&frame, target);
     if (frame == NULL || jpeg == nil) return;
     if (g_photoFrame != NULL) CFRelease(g_photoFrame);
     g_photoFrame = frame;
@@ -1249,8 +1305,12 @@ static void vcam_install_photo_overrides(id photo) {
     // Logged beside the Live Photo movie's own note: which of the two the app
     // asks for first, and whether this path ran at all for a given capture, is
     // what tells a broken pairing apart from a capture that never was one.
-    vcam_live_note([NSString stringWithFormat:@"%@ still jpeg=%lu bytes",
-                    [NSDate date], (unsigned long)jpeg.length]);
+    // The target is logged beside the size, so a photo that comes back in the
+    // wrong shape says whether the pipeline named a shape at all and what it was
+    // — 0x0 meaning it named none and the clip's own 720x1280 was kept.
+    vcam_live_note([NSString stringWithFormat:@"%@ still jpeg=%lu bytes target=%.0fx%.0f",
+                    [NSDate date], (unsigned long)jpeg.length,
+                    target.width, target.height]);
 
     if (g_photoHookedClasses == nil) g_photoHookedClasses = [NSMutableArray new];
     NSString *cls = NSStringFromClass([photo class]);
@@ -1276,7 +1336,8 @@ static void vcam_install_photo_overrides(id photo) {
 
 + (NSData *)JPEGPhotoDataRepresentationForJPEGSampleBuffer:(CMSampleBufferRef)JPEGSampleBuffer
                                     previewPhotoSampleBuffer:(CMSampleBufferRef)previewPhotoSampleBuffer {
-    NSData *replaced = vcam_still_jpeg(NULL);
+    // As above: no photo object here, so no shape to render to.
+    NSData *replaced = vcam_still_jpeg(NULL, CGSizeZero);
     return replaced ?: %orig;
 }
 
