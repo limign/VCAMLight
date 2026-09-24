@@ -1716,6 +1716,77 @@ static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
     }];
 }
 
+// The recording's poster frame — the still the library files beside the movie
+// and the corner thumbnail the app shows when the recording ends.
+//
+// The app does not take it from the movie. It renders it from a live preview
+// buffer and writes it next to the recording as `<name>.largeThumbnail`, then
+// hands that path to the library in the persistence result's
+// `filteredVideoPreviewPath`. Measured on the device (2026-09-24, 2.0.28): that
+// file was 1080x1920 of the **real scene** — the apple on the desk — while the
+// 17.7-second movie beside it was the clip, which is the whole of "the
+// recording's first frame is what the camera saw".
+//
+// So the clip is rendered into that file too: frame 0, the frame the movie
+// itself starts on, and upright — `appliesPreferredTrackTransform` applies the
+// track's own display matrix, which is the quarter turn the still path has to do
+// by hand. Done once per path, and only when there is a file to replace, because
+// the app writes its own thumbnail before the persistence result is built.
+static void vcam_write_video_thumbnail(NSString *path) {
+    if (path.length == 0 || !vcam_active()) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) return;   // the app has not written one yet
+
+    static NSMutableSet *done = nil;
+    if (done == nil) done = [NSMutableSet new];
+    if ([done containsObject:path]) return;
+    [done addObject:path];
+
+    NSString *source = [VCAMFrameSource playbackPath];
+    if (source == nil) return;
+
+    AVURLAsset *clip = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:source] options:nil];
+    AVAssetImageGenerator *gen = [AVAssetImageGenerator assetImageGeneratorWithAsset:clip];
+    gen.appliesPreferredTrackTransform = YES;
+    gen.requestedTimeToleranceBefore = kCMTimeZero;
+    gen.requestedTimeToleranceAfter = kCMTimeZero;
+
+    CGImageRef image = [gen copyCGImageAtTime:kCMTimeZero actualTime:NULL error:nil];
+    if (image == NULL) {
+        vcam_live_note([NSString stringWithFormat:@"vthumb %@ no-frame",
+                        path.lastPathComponent]);
+        return;
+    }
+    // Scale 1 from a CGImage, so the JPEG is the picture's own size — a
+    // CIImage-backed UIImage here would encode at the screen's 3x.
+    UIImage *thumb = [UIImage imageWithCGImage:image];
+    NSData *jpeg = UIImageJPEGRepresentation(thumb, 0.95);
+    CGImageRelease(image);
+
+    NSNumber *before = [[fm attributesOfItemAtPath:path error:nil] objectForKey:NSFileSize];
+    BOOL ok = (jpeg != nil) && [jpeg writeToFile:path atomically:YES];
+    NSNumber *after = [[fm attributesOfItemAtPath:path error:nil] objectForKey:NSFileSize];
+    vcam_live_note([NSString stringWithFormat:@"vthumb %@ ok=%d size=%d->%d",
+                    path.lastPathComponent, ok, before.intValue, after.intValue]);
+}
+
+// The app asks a persistence result for the thumbnail path when it hands the
+// capture to the library, which is the moment the clip can go into that file:
+// measured, the file is already on disk by then and this is the only time in the
+// whole capture that anything asks.
+//
+// A getter with no arguments and one object return, so the signature needs no
+// guessing — `@16@0:8` off the device.
+%hook CAMVideoLocalPersistenceResult
+
+- (NSString *)filteredVideoPreviewPath {
+    NSString *path = %orig;
+    vcam_write_video_thumbnail(path);
+    return path;
+}
+
+%end
+
 %hook AVCaptureMovieFileOutput
 
 - (void)startRecordingToOutputFileURL:(NSURL *)outputFileURL
