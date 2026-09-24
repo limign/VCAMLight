@@ -369,7 +369,8 @@ static NSTimeInterval g_lastPreviewFrame = 0;
 // Renders one decoded frame to JPEG at the frame's own size, honouring the
 // orientation the capture connection reported.
 static NSData *vcam_jpeg_from_frame(CMSampleBufferRef frame,
-                                    AVCaptureVideoOrientation videoOrientation) {
+                                    AVCaptureVideoOrientation videoOrientation,
+                                    CGFloat quality) {
     if (frame == NULL) return nil;
     CVImageBufferRef pixels = CMSampleBufferGetImageBuffer(frame);
     if (pixels == NULL) return nil;
@@ -404,7 +405,45 @@ static NSData *vcam_jpeg_from_frame(CMSampleBufferRef frame,
     UIGraphicsEndImageContext();
     CGImageRelease(cg);
 
-    return UIImageJPEGRepresentation(img, 1.0);
+    return UIImageJPEGRepresentation(img, quality);
+}
+
+// Two captures of one frame were filed as one picture: Photos matches a capture
+// against the stills it holds, and a repeat comes back as a *duplicate* that
+// carries the older asset's movie — a real-scene movie from an earlier capture
+// came back under our photo that way. Measured, the match is exact: every pair
+// the library has filed as one has the same bytes, and neighbouring frames of the
+// clip — which look alike — are separate photos.
+//
+// So no two stills may be the same file. Two changes go into that, because which
+// part of a file the library reads is its own business: a comment segment naming
+// the moment the still was taken, and a compression quality that steps with it,
+// so the pictures are not identical either. Neither is visible in the photo.
+static unsigned long vcam_still_serial(void) {
+    static unsigned long serial = 0;
+    return ++serial;
+}
+
+// A comment segment goes just before the end of the file, outside the compressed
+// scan: nothing about the picture changes, and that is the usual place for one.
+// The marker also reads back out of a file in DCIM, which is how the library can
+// be asked whether it kept our still or filed an older one in its place.
+static NSData *vcam_marked_jpeg(NSData *jpeg, NSString *marker) {
+    NSData *text = [marker dataUsingEncoding:NSASCIIStringEncoding];
+    if (jpeg.length < 4 || text.length == 0 || text.length > 0xFFFD) return jpeg;
+
+    const uint8_t *bytes = (const uint8_t *)jpeg.bytes;
+    if (bytes[jpeg.length - 2] != 0xff || bytes[jpeg.length - 1] != 0xd9) return jpeg;
+
+    uint16_t length = (uint16_t)(text.length + 2);
+    uint8_t head[4] = {0xff, 0xfe, (uint8_t)(length >> 8), (uint8_t)(length & 0xff)};
+
+    NSMutableData *out = [NSMutableData dataWithCapacity:jpeg.length + text.length + 6];
+    [out appendData:[jpeg subdataWithRange:NSMakeRange(0, jpeg.length - 2)]];
+    [out appendBytes:head length:sizeof(head)];
+    [out appendData:text];
+    [out appendBytes:bytes + jpeg.length - 2 length:2];
+    return out;
 }
 
 // What is remembered of a still handed to the library is its size. Photos files
@@ -480,6 +519,11 @@ static void vcam_still_remember(NSString *stamp) {
 // Each retry skips well past a run instead, rendering only the frame it lands
 // on — the skips are just reads.
 static NSData *vcam_still_jpeg(CMSampleBufferRef *frameOut) {
+    unsigned long serial = vcam_still_serial();
+    NSString *marker = [NSString stringWithFormat:@"VCAMLight %lu-%lu",
+                        (unsigned long)[NSDate date].timeIntervalSince1970, serial];
+    CGFloat quality = 0.99 + 0.002 * (serial % 6);
+
     CMSampleBufferRef frame = NULL;
     NSData *jpeg = nil;
     NSString *stamp = nil;
@@ -492,8 +536,9 @@ static NSData *vcam_still_jpeg(CMSampleBufferRef *frameOut) {
         }
         frame = [VCAMFrameSource nextFrameForBuffer:NULL forceRenew:YES];
         if (frame == NULL) return nil;
-        jpeg = vcam_jpeg_from_frame(frame, g_photoOrientation);
+        jpeg = vcam_jpeg_from_frame(frame, g_photoOrientation, quality);
         if (jpeg == nil) return nil;
+        jpeg = vcam_marked_jpeg(jpeg, marker);
 
         stamp = vcam_still_stamp(jpeg);
         if (![vcam_seen_stamps() containsObject:stamp]) break;
