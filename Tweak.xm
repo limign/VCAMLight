@@ -801,11 +801,15 @@ static CVPixelBufferRef vcam_preview_buffer(CMSampleBufferRef frame) {
 
     CIImage *ci = [CIImage imageWithCVImageBuffer:pixels];
     if (ci == nil) return NULL;
-    // The orientation the camera stamps into its own captures. Applying it bakes
-    // the quarter turn into the pixels, which is the geometry the app expects.
-    // The transform below is the same quarter turn, for builds without it.
+    // Orientation 8, not the 6 the camera stamps into its own captures: what the
+    // app does with the buffer is apply 6 to it, and 8 is 6's inverse. Applying
+    // the same turn the app is about to apply would only put the picture right
+    // way up again on the second pass, which measured as an upside-down
+    // thumbnail. Measured semantics of -imageByApplyingOrientation: on this
+    // build: the value's own turn is applied to the pixels, so 6 turns them a
+    // quarter clockwise and 8 turns them a quarter counter-clockwise.
     if ([ci respondsToSelector:@selector(imageByApplyingOrientation:)]) {
-        ci = [ci imageByApplyingOrientation:6];
+        ci = [ci imageByApplyingOrientation:8];
     } else {
         ci = [ci imageByApplyingTransform:CGAffineTransformMake(0, 1, -1, 0, srcH, 0)];
     }
