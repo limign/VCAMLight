@@ -905,8 +905,12 @@ static NSTimeInterval g_lastToggle = 0;
 
 // How far apart the two presses may land and still count as one gesture. The
 // first cut used 200ms, which is tight even when you are trying to hit it — a
-// human pressing two buttons in sequence routinely lands nearer 300ms.
-#define VCAM_DP_WINDOW 0.45
+// human pressing two buttons in sequence routinely lands nearer 300ms. Measured
+// on the device while chasing the crash above: attempts landed 0.42s, 0.50s and
+// 1.95s apart, so 0.45s rejected two of the three. A deliberate one-button
+// fine-tune is not normally that fast; if this starts firing by accident, 0.45
+// is the number to go back to.
+#define VCAM_DP_WINDOW 0.8
 
 static void vcam_volume_pressed(BOOL isUp) {
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
@@ -976,17 +980,33 @@ static void vcam_volume_pressed(BOOL isUp) {
 
 // Observing only — these answer "did a client take the press?", so returning
 // %orig's answer untouched keeps the Camera's shutter working.
+//
+// The second argument is NOT an object, whatever the name suggests. Its type
+// encoding is `o^@?` — an out-pointer to a block, i.e. the caller passes the
+// address of a slot it expects to be filled in, and that slot is normally NULL.
+// Declaring it `(id)` makes ARC retain it on entry, so the retain reads the
+// slot's contents as an isa (0), then follows it to 0x20, and the process dies:
+//
+//   objc_retain + 16                              EXC_BAD_ACCESS, at 0x20
+//   VCAMLight.dylib   + 42816
+//   -[SBVolumeHardwareButtonActions _handleVolumeButtonDownForIncrease:modifiers:]
+//   VCAMLight.dylib   + 42736
+//   -[SBVolumeHardwareButton volumeIncreasePress:]
+//   VCAMLight.dylib   + 42560
+//
+// Measured on 15.7.1 (SpringBoard crash of 2026-09-24 09:47). A pointer type is
+// never retained, so `void **` both matches the ABI and stops ARC touching it.
 %hook SBHardwareButtonService
 
 - (BOOL)consumeVolumeIncreaseButtonSinglePressDownWithPriority:(long long)priority
-                                                  continuation:(id)continuation {
+                                                  continuation:(void **)continuation {
     BOOL taken = %orig;
     vcam_volume_pressed(YES);
     return taken;
 }
 
 - (BOOL)consumeVolumeDecreaseButtonSinglePressDownWithPriority:(long long)priority
-                                                  continuation:(id)continuation {
+                                                  continuation:(void **)continuation {
     BOOL taken = %orig;
     vcam_volume_pressed(NO);
     return taken;
