@@ -1718,6 +1718,37 @@ static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
                 });
             }),
             (IMP *)&original);
+
+        // The app books a recording under the URL it asked for, and starts the
+        // elapsed clock off that lookup, so handing it the scratch path at this
+        // one moment is enough to keep the whole recording state machine out:
+        // measured on a video-mode recording (2026-09-24), the delegate is given
+        // `/var/tmp/vcam_recording_1.MOV` here and the app's own URL at the
+        // finish, and nothing in between happens — no
+        // `CAMElapsedTimeView -startTimer` at all, the label frozen at 00:00
+        // while `recordedDuration` reads back 11.933s. The same capture with the
+        // replacement switched off starts the clock normally, so the URL is the
+        // whole of the difference.
+        //
+        // Handing this callback the app's own URL puts it back: measured under
+        // frida with exactly this rewrite, `-startTimer` is called from
+        // `CameraUI+0xb6ef0` — the same region the later `-endTimer` comes from —
+        // and the label runs 00:00:01, 03, 05.
+        __block void (*originalStart)(id, SEL, AVCaptureFileOutput *,
+                                      NSURL *, NSArray *) = NULL;
+        MSHookMessageEx(
+            [delegate class],
+            @selector(captureOutput:didStartRecordingToOutputFileAtURL:fromConnections:),
+            imp_implementationWithBlock(^(id dself, AVCaptureFileOutput *output,
+                                          NSURL *url, NSArray *connections) {
+                NSURL *appURL = g_recordingURLs[url.path];
+                if (originalStart) {
+                    originalStart(dself,
+                                  @selector(captureOutput:didStartRecordingToOutputFileAtURL:fromConnections:),
+                                  output, appURL ?: url, connections);
+                }
+            }),
+            (IMP *)&originalStart);
     }
 
     %orig(scratch ? [NSURL fileURLWithPath:scratch] : outputFileURL, delegate);
