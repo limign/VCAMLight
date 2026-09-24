@@ -998,6 +998,11 @@ static void vcam_install_photo_overrides(id photo) {
     g_photoPreview = vcam_preview_buffer(g_photoFrame);
 
     g_photoJPEG = jpeg;
+    // Logged beside the Live Photo movie's own note: which of the two the app
+    // asks for first, and whether this path ran at all for a given capture, is
+    // what tells a broken pairing apart from a capture that never was one.
+    vcam_live_note([NSString stringWithFormat:@"%@ still jpeg=%lu bytes",
+                    [NSDate date], (unsigned long)jpeg.length]);
 
     if (g_photoHookedClasses == nil) g_photoHookedClasses = [NSMutableArray new];
     NSString *cls = NSStringFromClass([photo class]);
