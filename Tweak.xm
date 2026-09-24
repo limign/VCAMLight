@@ -40,6 +40,8 @@ static BOOL vcam_active(void);
 static NSData *vcam_still_jpeg(CMSampleBufferRef *frameOut);
 // Defined with the recording path, called from the photo delegate above it.
 static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced));
+// One line per Live Photo movie handled, appended where the clip is staged.
+static void vcam_live_note(NSString *line);
 
 #pragma mark - Shared state
 
@@ -1077,6 +1079,9 @@ static void vcam_install_photo_overrides(id photo) {
                                                   CMTime displayTime, id resolved,
                                                   NSError *error) {
                         if (url == nil || error != nil || !vcam_active()) {
+                            vcam_live_note([NSString stringWithFormat:@"%@ skip url=%@ error=%@ active=%d",
+                                            [NSDate date], url.lastPathComponent,
+                                            error.localizedDescription, (int)vcam_active()]);
                             if (origLive) {
                                 origLive(dself, liveSel, output, url, duration,
                                          displayTime, resolved, error);
@@ -1196,12 +1201,50 @@ static NSString *const VCAMMediaTypeMeta = @"meta";
 // `DCIM/.MISC/Incoming`. So the metadata tracks and the top-level metadata — the
 // identifier among them — are carried over from the movie the daemon just wrote.
 //
-// The result is then written back over that file in place rather than swapped in
-// as a new one, so the file the library watched the daemon create is still there.
+// The clip goes in at the same path the app named, so nothing that reads that
+// path has to be taught a new one — but it arrives as a new file, never as bytes
+// written over the old one. The daemon wrote that file and may still hold it
+// open; a truncating write in between can take it out from under the daemon and
+// leave whoever reads next holding half a movie. Unlinking the daemon's file and
+// moving the finished export onto the path leaves it holding one whole movie
+// nobody else has a handle on.
+//
+// The export also holds the app's own delegate callback while it runs, and that
+// is the other thing this path answers for. Measured on the device: no Live Photo
+// captured since this replacement shipped has been filed *with* a movie — the
+// still is filed on its own and the movie is left behind in Incoming — and one of
+// those captures had a movie the export never touched (the daemon's own was still
+// in place), so the wait alone is as much a suspect as the write. vcam_live_note
+// writes the round trip down so the next capture can be read back rather than
+// guessed at.
+static void vcam_live_note(NSString *line) {
+    static NSFileManager *fm = nil;
+    if (fm == nil) fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:VCAM_PLAYBACK_DIR
+  withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *path = [VCAM_PLAYBACK_DIR stringByAppendingPathComponent:@"live.log"];
+    if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+    [handle seekToEndOfFile];
+    [handle writeData:[[line stringByAppendingString:@"\n"]
+                       dataUsingEncoding:NSUTF8StringEncoding]];
+    [handle closeFile];
+}
+
 static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
     NSString *source = [VCAMFrameSource playbackPath];
-    if (url == nil || source == nil) { done(NO); return; }
+    NSDate *began = [NSDate date];
+    if (url == nil || source == nil) {
+        vcam_live_note([NSString stringWithFormat:@"%@ no-source url=%@ source=%@",
+                        began, url.lastPathComponent, source]);
+        done(NO);
+        return;
+    }
 
+    NSFileManager *files = [NSFileManager defaultManager];
+    NSNumber *sizeBefore = [[files attributesOfItemAtPath:url.path error:nil]
+                            objectForKey:NSFileSize];
     AVURLAsset *movie = [AVURLAsset URLAssetWithURL:url options:nil];
     AVURLAsset *clip = [AVURLAsset URLAssetWithURL:[NSURL fileURLWithPath:source] options:nil];
 
@@ -1214,6 +1257,8 @@ static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
         length = movieLength;
     }
     if (!CMTIME_IS_NUMERIC(length) || CMTimeCompare(length, kCMTimeZero) <= 0) {
+        vcam_live_note([NSString stringWithFormat:@"%@ no-length url=%@ movie=%lld clip=%lld",
+                        began, url.lastPathComponent, movieLength.value, clipLength.value]);
         done(NO);
         return;
     }
@@ -1231,8 +1276,10 @@ static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
                             preferredTrackID:kCMPersistentTrackID_Invalid];
         [added insertTimeRange:range ofTrack:track atTime:kCMTimeZero error:&error];
     }
+    NSUInteger metaTracks = 0;
     for (AVAssetTrack *track in movie.tracks) {
         if (![track.mediaType isEqualToString:VCAMMediaTypeMeta]) continue;
+        metaTracks++;
         AVMutableCompositionTrack *added =
             [comp addMutableTrackWithMediaType:track.mediaType
                             preferredTrackID:kCMPersistentTrackID_Invalid];
@@ -1242,8 +1289,15 @@ static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
                        ofTrack:track atTime:kCMTimeZero error:&error];
     }
 
-    NSURL *temp = [NSURL fileURLWithPath:
-                   [NSTemporaryDirectory() stringByAppendingPathComponent:@"vcam_live_movie.mov"]];
+    // Exported beside the file it will stand in for, so putting it in place is a
+    // rename on one volume and never a copy that grows where a reader might look.
+    // Named apart from anything the daemon writes, and apart from a second
+    // capture's export.
+    static NSUInteger seq = 0;
+    NSURL *temp = [[url URLByDeletingLastPathComponent]
+                   URLByAppendingPathComponent:
+                       [NSString stringWithFormat:@"vcam_live_%lu.mov",
+                        (unsigned long)++seq]];
 
     AVAssetExportSession *writer =
         [AVAssetExportSession exportSessionWithAsset:comp
@@ -1251,6 +1305,8 @@ static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
     if (writer == nil) {
         // Nothing to carry the metadata with. A movie the library will not pair
         // with its photo still beats no movie at all.
+        vcam_live_note([NSString stringWithFormat:@"%@ no-writer url=%@ meta=%lu",
+                        began, url.lastPathComponent, (unsigned long)metaTracks]);
         vcam_export_clip(url, length, done);
         return;
     }
@@ -1263,13 +1319,19 @@ static void vcam_replace_live_movie(NSURL *url, void (^done)(BOOL replaced)) {
         NSFileManager *fm = [NSFileManager defaultManager];
         BOOL ok = (writer.status == AVAssetExportSessionStatusCompleted);
         if (ok) {
-            NSData *bytes = [NSData dataWithContentsOfURL:temp];
-            ok = (bytes != nil) && [bytes writeToFile:url.path atomically:NO];
-            if (!ok) {
-                [fm removeItemAtURL:url error:nil];
-                ok = [fm moveItemAtURL:temp toURL:url error:nil];
-            }
+            // The daemon's file is unlinked, never opened: the finished export is
+            // moved onto the path in one step.
+            [fm removeItemAtURL:url error:nil];
+            ok = [fm moveItemAtURL:temp toURL:url error:nil];
         }
+        NSNumber *sizeAfter = [[fm attributesOfItemAtPath:url.path error:nil]
+                               objectForKey:NSFileSize];
+        vcam_live_note([NSString stringWithFormat:
+                        @"%@ %@ movie=%.3fs clip=%.3fs meta=%lu took=%dms ok=%d size=%d->%d status=%ld",
+                        began, url.lastPathComponent,
+                        CMTimeGetSeconds(movieLength), CMTimeGetSeconds(clipLength),
+                        (unsigned long)metaTracks, (int)(-[began timeIntervalSinceNow] * 1000),
+                        ok, sizeBefore.intValue, sizeAfter.intValue, (long)writer.status]);
         [fm removeItemAtURL:temp error:nil];
         dispatch_async(dispatch_get_main_queue(), ^{ done(ok); });
     }];
